@@ -19,3 +19,8 @@ default = ["vulkan"]
 # GPU transcription through whisper.cpp's Vulkan backend. Needs the Vulkan
 # headers (`vulkan-headers` on Arch) and glslc (`shaderc`) to build.
 vulkan = ["whisper-rs/vulkan"]
+
+# Local only: whisper.cpp aborts in the DTW median filter on a very short
+# decode window; this copy skips DTW there. Not for upstream.
+[patch.crates-io]
+whisper-rs-sys = { path = "../whisper-rs-sys-dtw-fix" }
