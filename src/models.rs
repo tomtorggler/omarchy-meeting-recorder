@@ -23,7 +23,7 @@ pub struct Model {
     preset: DtwModelPreset,
 }
 
-pub const MODELS: [Model; 10] = [
+pub const MODELS: [Model; 11] = [
     Model {
         name: "tiny",
         size_mb: 75,
@@ -72,6 +72,13 @@ pub const MODELS: [Model; 10] = [
     Model {
         name: "large-v3-turbo",
         size_mb: 1600,
+        preset: DtwModelPreset::LargeV3Turbo,
+    },
+    // The same model quantized: about a third of the memory, for a GPU that
+    // the desktop already fills halfway.
+    Model {
+        name: "large-v3-turbo-q5_0",
+        size_mb: 574,
         preset: DtwModelPreset::LargeV3Turbo,
     },
 ];
