@@ -15,6 +15,7 @@ mod ipc;
 mod meeting;
 mod models;
 mod nemotron;
+mod picker;
 mod player;
 mod settings;
 mod notes;
