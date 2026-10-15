@@ -12,6 +12,7 @@ mod calendar;
 mod chapters;
 mod diarize;
 mod export;
+mod files;
 mod find;
 mod ipc;
 mod library;

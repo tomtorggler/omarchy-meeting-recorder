@@ -1,7 +1,6 @@
-//! Bookmarks, portable transcript exports and atomic writes, independent of the UI.
+//! Bookmarks and portable transcript exports, independent of the UI.
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -19,33 +18,10 @@ pub fn bookmarks(dir: &Path) -> Vec<Bookmark> {
 }
 
 pub fn save_bookmarks(dir: &Path, bookmarks: &[Bookmark]) -> std::io::Result<()> {
-    atomic_write(
+    crate::files::atomic_write(
         &dir.join("bookmarks.json"),
         &serde_json::to_vec_pretty(bookmarks)?,
     )
-}
-
-/// Replace only after a complete, flushed write. Unique temps also handle multiple windows.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static SERIAL: AtomicU64 = AtomicU64::new(0);
-    let temp = path.with_extension(format!(
-        "tmp-{}-{}",
-        std::process::id(),
-        SERIAL.fetch_add(1, Ordering::Relaxed)
-    ));
-    let result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        std::fs::rename(&temp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(temp);
-    }
-    result
 }
 
 pub fn clean_text(markdown: &str) -> String {

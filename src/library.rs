@@ -114,7 +114,7 @@ impl Entry {
 }
 
 pub fn processing(dir: &Path) -> std::io::Result<()> {
-    crate::bookmarks::atomic_write(
+    crate::files::atomic_write(
         &dir.join(".processing"),
         b"Transcription was interrupted. Try transcribing again.",
     )
@@ -122,7 +122,7 @@ pub fn processing(dir: &Path) -> std::io::Result<()> {
 
 pub fn completed(dir: &Path, problem: Option<&str>) -> std::io::Result<()> {
     if let Some(problem) = problem {
-        crate::bookmarks::atomic_write(&dir.join(".processing"), problem.as_bytes())
+        crate::files::atomic_write(&dir.join(".processing"), problem.as_bytes())
     } else {
         match std::fs::remove_file(dir.join(".processing")) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),

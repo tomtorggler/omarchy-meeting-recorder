@@ -237,7 +237,7 @@ pub fn write(dir: &Path, manifest: &Manifest) -> std::io::Result<PathBuf> {
     let target = path_for(dir, &manifest.title);
     let old = find(dir);
     let text = serde_json::to_string_pretty(&manifest.to_json()).unwrap_or_default() + "\n";
-    crate::bookmarks::atomic_write(&target, text.as_bytes())?;
+    crate::files::atomic_write(&target, text.as_bytes())?;
     if let Some(old) = old
         && old != target
     {
@@ -260,12 +260,12 @@ pub fn update(dir: &Path, manifest: &Manifest, transcript: Option<&str>) -> std:
         None
     };
     if let Some(text) = transcript {
-        crate::bookmarks::atomic_write(&path, text.as_bytes())?;
+        crate::files::atomic_write(&path, text.as_bytes())?;
     }
     if let Err(error) = write(dir, manifest) {
         if transcript.is_some() {
             let restored = match previous {
-                Some(bytes) => crate::bookmarks::atomic_write(&path, &bytes),
+                Some(bytes) => crate::files::atomic_write(&path, &bytes),
                 None => std::fs::remove_file(&path),
             };
             if let Err(restore_error) = restored {

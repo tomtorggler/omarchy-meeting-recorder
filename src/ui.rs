@@ -3704,7 +3704,7 @@ fn write_recording_note(
         "language": language,
     });
     let _ =
-        crate::bookmarks::atomic_write(&staging.join("recording.json"), note.to_string().as_bytes());
+        crate::files::atomic_write(&staging.join("recording.json"), note.to_string().as_bytes());
 }
 
 fn read_recording_note(staging: &std::path::Path) -> Option<RecordingNote> {

@@ -168,7 +168,7 @@ impl Recorder {
         }
         match updated.as_ref() {
             Some(manifest) => meeting::update(&out, manifest, Some(&markdown)),
-            None => crate::bookmarks::atomic_write(&out.join("transcript.md"), markdown.as_bytes()),
+            None => crate::files::atomic_write(&out.join("transcript.md"), markdown.as_bytes()),
         }
         .map_err(|e| format!("could not save the transcript: {e}"))?;
         *self.manifest.borrow_mut() = updated;

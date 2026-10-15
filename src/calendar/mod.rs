@@ -85,7 +85,7 @@ impl Config {
             .map_err(|_| "Could not create calendar settings folder.")?;
         let bytes =
             serde_json::to_vec_pretty(self).map_err(|_| "Could not encode calendar settings.")?;
-        crate::bookmarks::atomic_write(&path, &bytes)
+        crate::files::atomic_write(&path, &bytes)
             .map_err(|_| "Could not save calendar settings.".into())
     }
 }

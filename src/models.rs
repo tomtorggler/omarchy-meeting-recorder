@@ -127,7 +127,7 @@ pub fn save_configured(name: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    crate::bookmarks::atomic_write(&path, config.as_bytes())
+    crate::files::atomic_write(&path, config.as_bytes())
 }
 
 /// The configured model: a name from `MODELS` or a path to a model file.

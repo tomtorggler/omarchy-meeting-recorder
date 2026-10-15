@@ -70,7 +70,7 @@ fn edit_file(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    crate::bookmarks::atomic_write(path, next.as_bytes()).map_err(|e| e.to_string())
+    crate::files::atomic_write(path, next.as_bytes()).map_err(|e| e.to_string())
 }
 
 fn edit(text: &str, previous: Option<&Action>, action: Option<&Action>) -> Result<String, String> {

@@ -408,7 +408,7 @@ impl Recorder {
             tidy.push(line);
         }
         let after = tidy.join("\n") + "\n";
-        if crate::bookmarks::atomic_write(&path, after.as_bytes()).is_err() {
+        if crate::files::atomic_write(&path, after.as_bytes()).is_err() {
             self.toast("Could not save the transcript");
             return None;
         }
@@ -471,7 +471,7 @@ impl Recorder {
                 return;
             }
             if let Some(dir) = r.result_dir.borrow().clone() {
-                match crate::bookmarks::atomic_write(&dir.join("transcript.md"), before.as_bytes()) {
+                match crate::files::atomic_write(&dir.join("transcript.md"), before.as_bytes()) {
                     Ok(()) => r.redraw_transcript(&before),
                     Err(error) => r.toast(&format!("Could not undo deletion: {error}")),
                 }
