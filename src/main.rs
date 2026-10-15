@@ -7,22 +7,27 @@ mod agent;
 mod animation;
 mod audio;
 mod bar_widget;
+mod bookmarks;
+mod calendar;
 mod chapters;
 mod diarize;
 mod export;
 mod find;
 mod ipc;
+mod library;
 mod meeting;
 mod models;
 mod nemotron;
 mod picker;
 mod player;
+mod process;
 mod settings;
 mod notes;
 mod theme;
 mod transcribe;
 mod ui;
 mod webcam;
+mod worker;
 
 use gtk::glib;
 
@@ -123,6 +128,7 @@ fn send_or_open(lines: Vec<String>) -> glib::ExitCode {
 fn main() -> glib::ExitCode {
     match std::env::args().nth(1).as_deref() {
         None => ui::run(None),
+        Some("__transcribe-worker") => worker::run(),
         Some("--version" | "-V") => {
             let backend = if cfg!(feature = "vulkan") {
                 "Vulkan support; CPU fallback"
@@ -173,7 +179,7 @@ fn main() -> glib::ExitCode {
                 "Usage: {APP_NAME} [[start] [--name <name>] [--notes <file>] | stop | pause | compact | watch | wait [--audio] | transcribe <mic> <computer> [--language xx]]"
             );
             println!();
-            println!("  (no command)  open the recorder, ready to record");
+            println!("  (no command)  open your meetings and recent transcripts");
             println!("  --name <name>   name the meeting about to be recorded, whoever presses Start");
             println!(
                 "  --notes <file>  show the file as meeting notes next to the recorder, to read from and edit while recording"

@@ -18,12 +18,23 @@ use crate::audio::{self, Devices, HISTORY, Role, Source, to_meter};
 use crate::chapters::{self, Chapter};
 use crate::export::{self, Format, export_audio, export_tracks};
 use crate::ipc::{self, SharedStatus, Status};
-use crate::meeting::{self, Manifest};
+use crate::meeting::{self, Manifest, clock_to_ms, parse_segment};
 use crate::picker::Picker;
 use crate::player::Player;
 use crate::notes::Notes;
 use crate::transcribe::{self, Abort, CANCELLED, Event, LANGUAGES};
 use crate::{APP_ID, APP_NAME, settings};
+
+mod action_settings;
+mod calendar;
+mod calendar_settings;
+mod chapter_jobs;
+mod home;
+mod hub;
+mod review_tools;
+mod transcription;
+use calendar::calendar_invitees_row;
+use hub::Hub;
 
 const MIC_COLOR: (f64, f64, f64) = (0.21, 0.52, 0.89);
 const SYSTEM_COLOR: (f64, f64, f64) = (0.90, 0.38, 0.0);
@@ -48,6 +59,17 @@ enum State {
 }
 
 impl State {
+    fn busy(self) -> bool {
+        matches!(
+            self,
+            Self::Recording | Self::Stopping | Self::Transcribing
+        )
+    }
+
+    fn has_transcript(self) -> bool {
+        self == Self::Done
+    }
+
     fn key(self) -> &'static str {
         match self {
             State::Idle => "idle",
@@ -59,15 +81,7 @@ impl State {
     }
 }
 
-/// Where a transcription reads its two tracks from.
-enum Tracks {
-    /// The staging files of a recording that just stopped.
-    Raw(PathBuf),
-    /// The `.tracks` directory kept in a meeting folder.
-    Kept(PathBuf),
-    /// One imported file, with the number of speakers asked for.
-    Single(PathBuf, Option<usize>),
-}
+use crate::worker::Tracks;
 
 /// The imported source audio, kept for transcribing again.
 fn source_track(meeting_dir: &std::path::Path) -> PathBuf {
@@ -76,227 +90,6 @@ fn source_track(meeting_dir: &std::path::Path) -> PathBuf {
 
 /// Choices in the import dialog: automatic, then a fixed number.
 const SPEAKER_CHOICES: [&str; 7] = ["Automatic", "1", "2", "3", "4", "5", "6"];
-
-/// What all windows share: the audio sources, the socket for the bar widget
-/// and the keybindings, and the list of open windows. Every window can show
-/// its own meeting; only one records at a time.
-struct Hub {
-    mic: Source,
-    system: Source,
-    statuses: ipc::Statuses,
-    /// The open windows, oldest first. Held here: the window's own callbacks
-    /// only hold weak references, so this is what keeps a window's recorder
-    /// alive until the window is gone.
-    windows: RefCell<Vec<Rc<Recorder>>>,
-    /// The microphones and outputs for the menus, `None` until first listed.
-    devices: RefCell<Option<Devices>>,
-}
-
-impl Hub {
-    fn new(app: &adw::Application) -> Rc<Self> {
-        let hub = Rc::new(Hub {
-            mic: Source::spawn(settings::device_to_record(Role::Mic)),
-            system: Source::spawn(settings::device_to_record(Role::System)),
-            statuses: ipc::Statuses::default(),
-            windows: RefCell::default(),
-            devices: RefCell::default(),
-        });
-        hub.watch_devices();
-        let (commands_tx, commands_rx) = async_channel::unbounded();
-        ipc::serve(
-            hub.statuses.clone(),
-            hub.mic.clone(),
-            hub.system.clone(),
-            commands_tx,
-        );
-        let weak = Rc::downgrade(&hub);
-        let app_for_commands = app.clone();
-        glib::spawn_future_local(async move {
-            while let Ok(command) = commands_rx.recv().await {
-                let Some(hub) = weak.upgrade() else {
-                    break;
-                };
-                hub.command(&app_for_commands, command.0, &command.1);
-            }
-        });
-
-        let new_window = gio::SimpleAction::new("new-window", None);
-        let weak = Rc::downgrade(&hub);
-        let app_for_new = app.clone();
-        new_window.connect_activate(move |_, _| {
-            if let Some(hub) = weak.upgrade() {
-                hub.add_window(&app_for_new).window.present();
-            }
-        });
-        app.add_action(&new_window);
-
-        // Quitting closes every window; one in the middle of a meeting asks first.
-        let quit = gio::SimpleAction::new("quit", None);
-        let weak = Rc::downgrade(&hub);
-        quit.connect_activate(move |_, _| {
-            if let Some(hub) = weak.upgrade() {
-                for recorder in hub.recorders() {
-                    recorder.window.close();
-                }
-            }
-        });
-        app.add_action(&quit);
-        hub
-    }
-
-    /// Lists the devices now and again whenever one comes or goes, so a
-    /// headset plugged in shows up in the menus.
-    fn watch_devices(self: &Rc<Self>) {
-        let (changed_tx, changed) = async_channel::bounded(1);
-        let _ = changed_tx.try_send(());
-        audio::watch_devices(move || {
-            !matches!(
-                changed_tx.try_send(()),
-                Err(async_channel::TrySendError::Closed(_))
-            )
-        });
-        let weak = Rc::downgrade(self);
-        glib::spawn_future_local(async move {
-            while changed.recv().await.is_ok() {
-                // Changes come in bursts: list once they have settled.
-                glib::timeout_future(Duration::from_millis(150)).await;
-                let _ = changed.try_recv();
-                let Ok(devices) = gio::spawn_blocking(audio::devices).await else {
-                    continue;
-                };
-                let Some(hub) = weak.upgrade() else {
-                    break;
-                };
-                *hub.devices.borrow_mut() = Some(devices);
-                hub.update_pickers();
-            }
-        });
-    }
-
-    /// Shows the devices, and the ones being recorded, in every window.
-    fn update_pickers(&self) {
-        let devices = self.devices.borrow();
-        for recorder in self.recorders() {
-            recorder.update_pickers(devices.as_ref());
-        }
-    }
-
-    fn add_window(self: &Rc<Self>, app: &adw::Application) -> Rc<Recorder> {
-        let recorder = Recorder::new(app, self);
-        self.windows.borrow_mut().push(recorder.clone());
-        recorder.learn_hypr_address();
-        let weak = Rc::downgrade(self);
-        let status = recorder.shared.clone();
-        recorder.window.connect_destroy(move |_| {
-            if let Some(hub) = weak.upgrade() {
-                hub.statuses
-                    .lock()
-                    .unwrap()
-                    .retain(|s| !Arc::ptr_eq(s, &status));
-                hub.windows
-                    .borrow_mut()
-                    .retain(|r| !Arc::ptr_eq(&r.shared, &status));
-            }
-        });
-        recorder
-    }
-
-    /// The open windows, oldest first.
-    fn recorders(&self) -> Vec<Rc<Recorder>> {
-        self.windows.borrow().clone()
-    }
-
-    /// The window that is recording, if any.
-    fn recording(&self) -> Option<Rc<Recorder>> {
-        self.recorders()
-            .into_iter()
-            .find(|r| matches!(r.state.get(), State::Recording | State::Stopping))
-    }
-
-    /// Where the bar widget and the keybindings act: the window recording,
-    /// else the one transcribing, else the one in front, else a new one.
-    fn target(self: &Rc<Self>, app: &adw::Application) -> Rc<Recorder> {
-        let recorders = self.recorders();
-        let active = app.active_window();
-        self.recording()
-            .or_else(|| {
-                recorders
-                    .iter()
-                    .find(|r| r.state.get() == State::Transcribing)
-                    .cloned()
-            })
-            .or_else(|| {
-                recorders
-                    .iter()
-                    .find(|r| active.as_ref() == Some(r.window.upcast_ref()))
-                    .cloned()
-            })
-            .or_else(|| recorders.last().cloned())
-            .unwrap_or_else(|| self.add_window(app))
-    }
-
-    /// A window free to show a meeting: the one in front when it is not busy,
-    /// else another free one, else a new one.
-    fn free_window(self: &Rc<Self>, app: &adw::Application) -> Rc<Recorder> {
-        let free = |r: &Rc<Recorder>| matches!(r.state.get(), State::Idle | State::Done);
-        let recorders = self.recorders();
-        let active = app.active_window();
-        recorders
-            .iter()
-            .find(|r| active.as_ref() == Some(r.window.upcast_ref()) && free(r))
-            .or_else(|| recorders.iter().rev().find(|r| free(r)))
-            .cloned()
-            .unwrap_or_else(|| self.add_window(app))
-    }
-
-    /// A command from the socket: `omarchy-meeting-recorder start` and friends.
-    /// `title` is what came with it: the name for `start`, the notes file for
-    /// `notes`, "" without one.
-    fn command(self: &Rc<Self>, app: &adw::Application, command: &str, title: &str) {
-        if command == "new-window" {
-            self.add_window(app).window.present();
-            return;
-        }
-        if command == "notes" || command == "name" {
-            let r = self.recording().unwrap_or_else(|| self.free_window(app));
-            // Notes are for reading while recording: a window showing a meeting
-            // goes back to the recording page first.
-            if r.state.get() == State::Done {
-                r.ready();
-            }
-            if command == "notes" {
-                r.open_notes(std::path::Path::new(title));
-            } else if r.state.get() == State::Idle {
-                set_name(&r.title_row, title);
-            }
-            r.window.present();
-            return;
-        }
-        let r = match command {
-            // Starting takes a window that is free, so a meeting being
-            // transcribed stays on screen.
-            "start" => self.recording().unwrap_or_else(|| self.free_window(app)),
-            _ => self.target(app),
-        };
-        match command {
-            // A name typed on the ready page is kept unless the command
-            // brings one; from the done page it starts fresh.
-            "start" if matches!(r.state.get(), State::Idle | State::Done) => {
-                if r.state.get() == State::Done {
-                    r.ready();
-                }
-                if !title.is_empty() {
-                    set_name(&r.title_row, title);
-                }
-                r.start();
-            }
-            "stop" => r.stop(),
-            "compact" => r.set_compact(!r.compact.get()),
-            "pause" => r.toggle_pause(),
-            _ => {}
-        }
-    }
-}
 
 /// Runs the app. `open` is a `.meeting-recorder` file or a meeting folder to show
 /// instead of starting a new recording.
@@ -317,6 +110,9 @@ pub fn run(open: Option<&str>) -> glib::ExitCode {
         app.set_accels_for_action("window.close", &["<Control>w"]);
         app.set_accels_for_action("app.quit", &["<Control>q"]);
         app.set_accels_for_action("app.new-window", &["<Control>n"]);
+        app.set_accels_for_action("app.record", &["<Control>r"]);
+        app.set_accels_for_action("app.home", &["<Control>h"]);
+        app.set_accels_for_action("win.bookmark", &["<Control>b"]);
     });
     // Made on the first activation, once GTK is up: it starts the audio.
     let hub: Rc<RefCell<Option<Rc<Hub>>>> = Rc::default();
@@ -334,12 +130,9 @@ pub fn run(open: Option<&str>) -> glib::ExitCode {
     let hub_for_open = get_hub.clone();
     app.connect_open(move |app, files, _| {
         let hub = hub_for_open(app);
-        // A window in the middle of a meeting keeps it; the file gets its own.
-        let recorder = hub.free_window(app);
         if let Some(path) = files.first().and_then(|f| f.path()) {
-            recorder.open_meeting(&path);
+            hub.open_saved(&path, None);
         }
-        recorder.window.present();
     });
     app.connect_activate(move |app| {
         let hub = get_hub(app);
@@ -351,7 +144,11 @@ pub fn run(open: Option<&str>) -> glib::ExitCode {
             let recorder = recorder.clone();
             glib::idle_add_local_once(move || recorder.offer_recovery());
         }
-        recorder.window.present();
+        if hub.recording().is_some() {
+            hub.present_recorder(&recorder);
+        } else {
+            hub.show_home();
+        }
     });
     match open {
         Some(path) => app.run_with_args(&[APP_NAME, path]),
@@ -367,6 +164,8 @@ struct Recorder {
     compact_action: gio::SimpleAction,
     compact_button: gtk::Button,
     title_row: adw::EntryRow,
+    calendar_rows: [adw::ActionRow; 2],
+    calendar_meeting: RefCell<Option<crate::calendar::Meeting>>,
     format_row: adw::ComboRow,
     language_row: adw::ComboRow,
     /// Whether to record the camera next to the audio.
@@ -390,6 +189,7 @@ struct Recorder {
     copy_button: gtk::Button,
     /// Your own scripts from config.toml, hidden when there are none.
     actions_button: gtk::MenuButton,
+    fresh_transcript: Cell<bool>,
     /// In its place when there are none: opens the page on how to add them.
     add_actions_button: gtk::Button,
     again_button: gtk::Button,
@@ -437,6 +237,9 @@ struct Recorder {
     /// The meeting whose automatic actions are still to run: set when its
     /// transcript is done, taken once the chapters are too.
     auto_actions_due: RefCell<Option<PathBuf>>,
+    /// How many of your actions are running on this window's meeting.
+    actions_running: Cell<u32>,
+    meeting_generation: Cell<u64>,
     current_line: Cell<i32>,
 
     mic: Source,
@@ -455,13 +258,17 @@ struct Recorder {
     started_at: Cell<i64>,
     paused: Cell<bool>,
     frozen: [Frozen; 2],
-    /// When the animation came on screen, to keep it there long enough.
-    animation_since: Cell<Option<std::time::Instant>>,
     paused_secs: Cell<i64>,
     pause_began: Cell<i64>,
     pause_button: gtk::Button,
     import_button: gtk::Button,
     model_banner: adw::Banner,
+    health_banner: adw::Banner,
+    health_last: RefCell<String>,
+    capture_problem: RefCell<Option<String>>,
+    bookmark_button: gtk::Button,
+    bookmark_menu: gtk::MenuButton,
+    bookmarks: RefCell<Vec<crate::bookmarks::Bookmark>>,
     model_downloading: Cell<bool>,
     drop_hint: gtk::Label,
     staging: RefCell<Option<PathBuf>>,
@@ -513,11 +320,19 @@ impl Recorder {
             .visible(false)
             .build();
         header.pack_end(&find_button);
+        let home_button = gtk::Button::builder()
+            .icon_name("go-home-symbolic")
+            .tooltip_text("Meetings (Ctrl+H)")
+            .action_name("app.home")
+            .build();
+        header.pack_start(&home_button);
         view.add_top_bar(&header);
         // Under the header bar, full width, while the speech model still has
         // to be downloaded.
         let model_banner = adw::Banner::builder().revealed(false).build();
         view.add_top_bar(&model_banner);
+        let health_banner = adw::Banner::builder().revealed(false).build();
+        view.add_top_bar(&health_banner);
         let toasts = adw::ToastOverlay::new();
         view.set_content(Some(&toasts));
         view.set_hexpand(true);
@@ -593,8 +408,15 @@ impl Recorder {
             }
         });
         group.add(&title_row);
-        group.add(&format_row);
-        group.add(&language_row);
+        let calendar_recording = calendar_invitees_row();
+        group.add(&calendar_recording);
+        let options = adw::ExpanderRow::builder()
+            .title("Recording options")
+            .subtitle("Language and audio format")
+            .build();
+        options.add_row(&format_row);
+        options.add_row(&language_row);
+        group.add(&options);
         group.add(&webcam_row);
         content.append(&group);
 
@@ -654,6 +476,12 @@ impl Recorder {
             .spacing(10)
             .halign(gtk::Align::Center)
             .build();
+        let bookmark_button = gtk::Button::builder()
+            .icon_name("bookmark-new-symbolic")
+            .tooltip_text("Bookmark this moment (Ctrl+B)")
+            .action_name("win.bookmark")
+            .build();
+        buttons.append(&bookmark_button);
         buttons.append(&pause_button);
         buttons.append(&button);
         content.append(&buttons);
@@ -707,6 +535,8 @@ impl Recorder {
             .show_apply_button(true)
             .build();
         done_group.add(&done_title_row);
+        let calendar_done = calendar_invitees_row();
+        done_group.add(&calendar_done);
         left.append(&done_group);
 
         // Chapters: a list to jump through, with the agent's button in the header.
@@ -759,8 +589,8 @@ impl Recorder {
             .build();
         left.append(&actions_button);
         let add_actions_button = gtk::Button::builder()
-            .label("Add actions…")
-            .tooltip_text("How to run your own scripts on a meeting")
+            .label("Manage actions…")
+            .tooltip_text("Add a script to run on a meeting")
             .css_classes(["pill"])
             .visible(false)
             .build();
@@ -787,14 +617,13 @@ impl Recorder {
             .selected(language_row.selected())
             .build();
         let again_button = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
+            .label("Transcribe again")
             .tooltip_text("Transcribe again")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
+            .css_classes(["pill"])
             .build();
-        again_language_row.add_suffix(&again_button);
         again_group.add(&again_language_row);
         left.append(&again_group);
+        left.append(&again_button);
 
         let right = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -803,6 +632,11 @@ impl Recorder {
             .build();
         let player = Player::new();
         right.append(player.widget());
+        let bookmark_menu = gtk::MenuButton::builder()
+            .label("Bookmarks")
+            .halign(gtk::Align::End)
+            .build();
+        right.append(&bookmark_menu);
         // One row per paragraph: time and speaker in fixed columns, the text
         // wrapping in its own column so every line starts at the same place.
         let transcript_list = gtk::ListBox::builder()
@@ -873,8 +707,13 @@ impl Recorder {
             .margin_end(24)
             .build();
         // A fixed, narrow column on the left; the transcript takes the rest.
-        let left_column = adw::Clamp::builder()
+        let left_scroll = gtk::ScrolledWindow::builder()
             .child(&left)
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .build();
+        let left_column = adw::Clamp::builder()
+            .child(&left_scroll)
             .maximum_size(320)
             .tightening_threshold(320)
             .width_request(320)
@@ -968,8 +807,9 @@ impl Recorder {
         window.add_action(&compact_action);
         let find_action = gio::SimpleAction::new("find", None);
         window.add_action(&find_action);
-        let run_action = gio::SimpleAction::new("run-action", Some(glib::VariantTy::INT32));
+        let run_action = gio::SimpleAction::new("run-action", Some(glib::VariantTy::STRING));
         window.add_action(&run_action);
+        window.add_action(&gio::SimpleAction::new("manage-actions", None));
 
         let recorder = Rc::new(Recorder {
             window,
@@ -979,6 +819,8 @@ impl Recorder {
             compact_action,
             compact_button,
             title_row,
+            calendar_rows: [calendar_recording, calendar_done],
+            calendar_meeting: RefCell::default(),
             format_row,
             language_row,
             webcam_row,
@@ -997,6 +839,7 @@ impl Recorder {
             button,
             copy_button,
             actions_button,
+            fresh_transcript: Cell::new(false),
             add_actions_button,
             again_button,
             done_title_row,
@@ -1030,6 +873,8 @@ impl Recorder {
             agent: std::cell::OnceCell::new(),
             generating: Cell::new(false),
             auto_actions_due: RefCell::default(),
+            actions_running: Cell::new(0),
+            meeting_generation: Cell::new(0),
             current_line: Cell::new(-1),
             mic,
             system,
@@ -1043,12 +888,17 @@ impl Recorder {
             started_at: Cell::new(0),
             paused: Cell::new(false),
             frozen,
-            animation_since: Cell::new(None),
             paused_secs: Cell::new(0),
             pause_began: Cell::new(0),
             pause_button,
             import_button,
             model_banner,
+            health_banner,
+            health_last: RefCell::default(),
+            capture_problem: RefCell::default(),
+            bookmark_button,
+            bookmark_menu,
+            bookmarks: RefCell::default(),
             model_downloading: Cell::new(false),
             drop_hint,
             staging: RefCell::default(),
@@ -1064,6 +914,8 @@ impl Recorder {
         });
         recorder.connect_signals(&open_button, &new_button);
         recorder.connect_find(&find_close);
+        recorder.connect_review_tools();
+        recorder.export_controls(&left);
         recorder.render();
         recorder
     }
@@ -1400,7 +1252,15 @@ impl Recorder {
         let weak = Rc::downgrade(self);
         new_button.connect_clicked(move |_| {
             if let Some(r) = weak.upgrade() {
-                r.ready();
+                if r.state.get().busy() {
+                    if let (Some(hub), Some(app)) = (r.hub.upgrade(), r.window.application()) {
+                        let next = hub.free_window(&app.downcast::<adw::Application>().unwrap());
+                        next.ready();
+                        hub.present_recorder(&next);
+                    }
+                } else {
+                    r.ready();
+                }
             }
         });
 
@@ -1440,6 +1300,7 @@ impl Recorder {
                         r.started_at.get(),
                         r.selected_format(),
                         r.selected_language(),
+                        r.calendar_meeting.borrow().as_ref(),
                     );
                 }
                 r.shared.lock().unwrap().title = row.text().to_string();
@@ -1474,6 +1335,9 @@ impl Recorder {
         let weak = Rc::downgrade(self);
         self.copy_button.connect_clicked(move |_| {
             let Some(r) = weak.upgrade() else { return };
+            if r.state.get() != State::Done {
+                return;
+            }
             let Some(dir) = r.result_dir.borrow().clone() else {
                 return;
             };
@@ -1494,11 +1358,11 @@ impl Recorder {
                 r.refresh_actions();
             }
         });
-        self.add_actions_button.connect_clicked(|_| {
-            let _ = gio::AppInfo::launch_default_for_uri(
-                crate::actions::DOCS,
-                None::<&gio::AppLaunchContext>,
-            );
+        let weak = Rc::downgrade(self);
+        self.add_actions_button.connect_clicked(move |_| {
+            if let Some(r) = weak.upgrade() {
+                r.configure_action();
+            }
         });
         if let Some(action) = self.window.lookup_action("run-action") {
             let weak = Rc::downgrade(self);
@@ -1506,12 +1370,24 @@ impl Recorder {
                 .downcast::<gio::SimpleAction>()
                 .expect("run-action is a SimpleAction")
                 .connect_activate(move |_, parameter| {
-                    let index = parameter.and_then(|p| p.get::<i32>());
-                    if let (Some(r), Some(index)) = (weak.upgrade(), index) {
-                        r.run_action(index as usize);
+                    let name = parameter.and_then(|p| p.get::<String>());
+                    if let (Some(r), Some(name)) = (weak.upgrade(), name) {
+                        r.run_action(&name);
                     }
                 });
         }
+
+        let weak = Rc::downgrade(self);
+        self.window
+            .lookup_action("manage-actions")
+            .unwrap()
+            .downcast::<gio::SimpleAction>()
+            .unwrap()
+            .connect_activate(move |_, _| {
+                if let Some(r) = weak.upgrade() {
+                    r.configure_action();
+                }
+            });
 
         let weak = Rc::downgrade(self);
         self.again_button.connect_clicked(move |_| {
@@ -1530,7 +1406,7 @@ impl Recorder {
                 let result = this
                     .run_transcription(tracks, this.selected_language())
                     .await;
-                this.hold_animation(&result).await;
+                this.animation.set_running(false);
                 this.finished(true, result);
             });
         });
@@ -1549,8 +1425,13 @@ impl Recorder {
                     r.confirm_close_transcribing();
                     glib::Propagation::Stop
                 }
-                // Saving the audio takes a moment; finish it, then quit.
+                // Saving the audio takes a moment, and your actions may still
+                // be running; finish them, then quit.
                 State::Stopping => {
+                    r.close_when_done();
+                    glib::Propagation::Stop
+                }
+                State::Done if r.acting() => {
                     r.close_when_done();
                     glib::Propagation::Stop
                 }
@@ -1594,32 +1475,44 @@ impl Recorder {
         }
     }
 
-    /// The Actions menu from config.toml, and the button only when there are any.
+    /// The Actions menu from config.toml, with the manager under it, and the
+    /// button only when there are any.
     fn refresh_actions(&self) {
         let actions = crate::actions::load();
         let menu = gio::Menu::new();
-        for (index, action) in actions.iter().enumerate() {
+        let scripts = gio::Menu::new();
+        for action in &actions {
             let item = gio::MenuItem::new(Some(&action.name), None);
             item.set_action_and_target_value(
                 Some("win.run-action"),
-                Some(&(index as i32).to_variant()),
+                Some(&action.name.to_variant()),
             );
-            menu.append_item(&item);
+            scripts.append_item(&item);
         }
+        menu.append_section(None, &scripts);
+        let manage = gio::Menu::new();
+        manage.append(Some("Manage actions…"), Some("win.manage-actions"));
+        menu.append_section(None, &manage);
         self.actions_button.set_menu_model(Some(&menu));
         self.actions_button.set_visible(!actions.is_empty());
         self.add_actions_button.set_visible(actions.is_empty());
     }
 
     /// Runs one of your actions on this meeting from the menu.
-    fn run_action(self: &Rc<Self>, index: usize) {
-        let Some(action) = crate::actions::load().into_iter().nth(index) else {
+    fn run_action(self: &Rc<Self>, name: &str) {
+        let Some(action) = crate::actions::load().into_iter().find(|a| a.name == name) else {
             return;
         };
         let this = self.clone();
         glib::spawn_future_local(async move {
             this.perform(action).await;
+            this.close_if_asked();
         });
+    }
+
+    /// Whether your actions are running on this meeting, or about to.
+    fn acting(&self) -> bool {
+        self.actions_running.get() > 0 || self.auto_actions_due.borrow().is_some()
     }
 
     /// Runs the actions marked `auto = true` on the meeting they are due for,
@@ -1636,6 +1529,8 @@ impl Recorder {
             self.close_if_asked();
             return;
         }
+        // Counted from here, so the app does not quit before the first one starts.
+        self.actions_running.set(self.actions_running.get() + 1);
         let this = self.clone();
         glib::spawn_future_local(async move {
             for action in actions {
@@ -1644,6 +1539,7 @@ impl Recorder {
                 }
                 this.perform(action).await;
             }
+            this.actions_running.set(this.actions_running.get() - 1);
             this.close_if_asked();
         });
     }
@@ -1685,7 +1581,9 @@ impl Recorder {
         std::thread::spawn(move || {
             let _ = tx.send_blocking(crate::actions::run(&action, &folder, &manifest));
         });
+        self.actions_running.set(self.actions_running.get() + 1);
         let result = rx.recv().await;
+        self.actions_running.set(self.actions_running.get() - 1);
         running.dismiss();
         // The action may have edited the meeting: show what is on disk now.
         if crate::actions::fingerprint(&dir) != before {
@@ -1721,13 +1619,14 @@ impl Recorder {
     /// Reads the meeting on the done page again after something else changed
     /// it, keeping the player and the scroll position where they are.
     fn reload_meeting(self: &Rc<Self>, dir: &std::path::Path) {
-        if self.state.get() != State::Done || self.result_dir.borrow().as_deref() != Some(dir) {
+        if !self.state.get().has_transcript() || self.result_dir.borrow().as_deref() != Some(dir) {
             return;
         }
         let Some((_, manifest)) = meeting::open(dir) else {
             return;
         };
         set_name(&self.done_title_row, &manifest.title);
+        self.set_calendar_meeting(manifest.calendar.clone());
         set_name(&self.title_row, &manifest.title);
         *self.manifest.borrow_mut() = Some(manifest);
         if let Ok(text) = std::fs::read_to_string(dir.join("transcript.md")) {
@@ -1901,8 +1800,10 @@ impl Recorder {
         self.compact_button.set_visible(recording);
         self.find_button.set_visible(state == State::Done);
         self.compact_action.set_enabled(recording);
-        self.language_row
-            .set_sensitive(!matches!(state, State::Stopping | State::Transcribing));
+        self.language_row.set_sensitive(!matches!(
+            state,
+            State::Stopping | State::Transcribing
+        ));
         self.button.set_sensitive(matches!(
             state,
             State::Idle | State::Recording | State::Done
@@ -1911,6 +1812,8 @@ impl Recorder {
         self.button.remove_css_class("suggested-action");
         self.button.remove_css_class("destructive-action");
         self.pause_button.set_visible(recording);
+        self.bookmark_button.set_visible(recording);
+        self.bookmark_button.set_sensitive(!self.paused.get());
         self.import_button.set_visible(state == State::Idle);
         self.pause_button
             .set_label(if self.paused.get() { "Resume" } else { "Pause" });
@@ -1930,7 +1833,9 @@ impl Recorder {
             let (mic, computer) = export::tracks(dir);
             (mic.is_file() && computer.is_file()) || source_track(dir).is_file()
         });
-        self.again_button.set_sensitive(tracks_kept);
+        self.again_button
+            .set_sensitive(tracks_kept && state == State::Done);
+        self.actions_button.set_sensitive(state == State::Done);
         self.again_button.set_tooltip_text(Some(if tracks_kept {
             "Transcribe the meeting again with the selected language"
         } else {
@@ -2005,7 +1910,16 @@ impl Recorder {
         });
     }
 
-    fn tick(&self) {
+    fn tick(self: &Rc<Self>) {
+        self.update_health();
+        if self.state.get() == State::Recording
+            && (self.mic.recording_error().is_some() || self.system.recording_error().is_some())
+        {
+            // A write failure cannot silently leave one side recording alone.
+            // stop() snapshots the error and preserves all recoverable audio.
+            self.stop();
+            return;
+        }
         if self.state.get() == State::Recording {
             let elapsed = self.elapsed();
             let clock = format_elapsed(elapsed);
@@ -2101,7 +2015,7 @@ impl Recorder {
         });
     }
 
-    fn after_pause_change(&self) {
+    fn after_pause_change(self: &Rc<Self>) {
         self.update_preview();
         self.freeze_meters(self.paused.get());
         self.set_state(State::Recording);
@@ -2196,11 +2110,13 @@ impl Recorder {
         }
 
         self.player.unload();
+        self.set_calendar_meeting(None);
         set_name(&self.title_row, &title);
         self.started_at.set(started_at);
         *self.result_dir.borrow_mut() = Some(out.clone());
         *self.manifest.borrow_mut() = Some(Manifest {
             title: title.clone(),
+            calendar: None,
             started_at,
             duration_secs: 0,
             format: Format::Mono,
@@ -2213,7 +2129,6 @@ impl Recorder {
             chapters: Vec::new(),
             chapters_by: None,
         });
-        self.animation_since.set(Some(std::time::Instant::now()));
         self.animation.reset();
         self.animation.set_stage("Importing audio");
         self.animation.set_running(true);
@@ -2239,18 +2154,19 @@ impl Recorder {
                 }
                 Err(message) => Err(message),
             };
-            this.hold_animation(&result).await;
+            this.animation.set_running(false);
             this.finished(result.is_ok(), result);
         });
     }
 
     /// After a crash: offers to save recordings that were never stopped.
     fn offer_recovery(self: &Rc<Self>) {
-        let current = self.staging.borrow().clone();
-        let Some(staging) = unfinished_recordings()
-            .into_iter()
-            .find(|dir| Some(dir) != current.as_ref())
-        else {
+        let pending = self
+            .hub
+            .upgrade()
+            .map(|hub| hub.recoveries())
+            .unwrap_or_default();
+        let Some(staging) = pending.into_iter().next() else {
             // One question at a time: the bar widget waits for a start without a recovery.
             self.offer_bar_widget();
             return;
@@ -2283,7 +2199,11 @@ impl Recorder {
             "save" => this.recover(staging.clone(), note.clone()),
             _ => {}
         });
-        dialog.present(Some(&self.window));
+        if let Some(home) = self.hub.upgrade().and_then(|h| h.home.get().cloned()) {
+            dialog.present(Some(&home.window));
+        } else {
+            dialog.present(Some(&self.window));
+        }
     }
 
     /// Asks once whether the widget may go in the Omarchy bar.
@@ -2326,7 +2246,11 @@ impl Recorder {
                 }
             });
         });
-        dialog.present(Some(&self.window));
+        if let Some(home) = self.hub.upgrade().and_then(|h| h.home.get().cloned()) {
+            dialog.present(Some(&home.window));
+        } else {
+            dialog.present(Some(&self.window));
+        }
     }
 
     /// Picks an unfinished recording up where it stopped and finishes it like Stop does.
@@ -2337,10 +2261,12 @@ impl Recorder {
         }
         let note = note.unwrap_or_else(|| RecordingNote {
             title: "Recovered recording".to_owned(),
+            calendar: None,
             started_at: ipc::now() - raw_duration(&staging),
             format: settings::load_format(),
             language: settings::load_language().to_owned(),
         });
+        self.set_calendar_meeting(note.calendar.clone());
         set_name(&self.title_row, &note.title);
         if let Some(i) = Format::ALL.iter().position(|f| *f == note.format) {
             self.format_row.set_selected(i as u32);
@@ -2354,11 +2280,14 @@ impl Recorder {
         self.started_at.set(note.started_at);
         self.paused.set(false);
         self.paused_secs.set(0);
+        *self.bookmarks.borrow_mut() = crate::bookmarks::bookmarks(&staging);
         *self.staging.borrow_mut() = Some(staging);
         *self.result_dir.borrow_mut() = None;
-        // Straight into what Stop does from here.
-        self.set_state(State::Recording);
-        self.stop();
+        *self.capture_problem.borrow_mut() = None;
+        // Recovery owns files, not the shared capture devices. Another window
+        // may be recording while these old files are saved and transcribed.
+        let webcam = self.webcam.end();
+        self.save_recording(webcam);
     }
 
     /// Says so when the speech model is not on disk yet, with a button to get it.
@@ -2424,9 +2353,13 @@ impl Recorder {
 
     /// Back to the recording page, ready for the next meeting.
     fn ready(&self) {
+        self.fresh_transcript.set(false);
+        self.invalidate_chapters();
         self.player.unload();
         *self.result_dir.borrow_mut() = None;
         *self.manifest.borrow_mut() = None;
+        *self.capture_problem.borrow_mut() = None;
+        self.set_calendar_meeting(None);
         set_name(&self.title_row, "");
         self.timer.set_label("00:00");
         self.compact_timer.set_label("00:00");
@@ -2439,9 +2372,15 @@ impl Recorder {
         }
         self.set_state(State::Idle);
         self.update_model_banner();
+        if let Some(hub) = self.hub.upgrade() {
+            hub.settle_windows();
+        }
     }
 
     fn start(self: &Rc<Self>) {
+        if self.state.get().busy() {
+            return;
+        }
         // One recording at a time: the audio sources are shared by all windows.
         if let Some(other) = self.hub.upgrade().and_then(|hub| hub.recording())
             && !Rc::ptr_eq(&other, self)
@@ -2460,12 +2399,15 @@ impl Recorder {
                 .unwrap_or_else(|_| "Meeting".to_owned());
             set_name(&self.title_row, &title);
         }
+        self.bookmarks.borrow_mut().clear();
+        *self.capture_problem.borrow_mut() = None;
+        self.health_last.borrow_mut().clear();
         self.paused.set(false);
         self.paused_secs.set(0);
         self.pause_began.set(0);
         let staging = glib::user_cache_dir()
             .join(APP_NAME)
-            .join(ipc::now().to_string());
+            .join(format!("{}-{}", ipc::now(), glib::uuid_string_random()));
         if let Err(e) = std::fs::create_dir_all(&staging) {
             self.status_label
                 .set_label(&format!("Could not start recording: {e}"));
@@ -2511,6 +2453,7 @@ impl Recorder {
             started_at,
             self.selected_format(),
             self.selected_language(),
+            self.calendar_meeting.borrow().as_ref(),
         );
         *self.staging.borrow_mut() = Some(staging);
         *self.result_dir.borrow_mut() = None;
@@ -2531,10 +2474,18 @@ impl Recorder {
             self.paused.set(false);
         }
         self.freeze_meters(false);
-        self.animation_since.set(Some(std::time::Instant::now()));
         self.mic.stop_recording();
         self.system.stop_recording();
+        *self.capture_problem.borrow_mut() = self
+            .mic
+            .recording_error()
+            .or_else(|| self.system.recording_error());
         let webcam = self.webcam.end();
+        self.save_recording(webcam);
+    }
+
+    /// Export this window's staged files without changing shared capture devices.
+    fn save_recording(self: &Rc<Self>, webcam: crate::webcam::Plan) {
         let Some(staging) = self.staging.borrow().clone() else {
             return;
         };
@@ -2544,10 +2495,26 @@ impl Recorder {
         self.animation.set_stage("Saving audio");
         self.animation.set_running(true);
         self.set_state(State::Stopping);
+        if let Some(hub) = self.hub.upgrade() {
+            hub.show_home();
+        }
 
         let format = self.selected_format();
         let language = self.selected_language();
-        let out = output_dir(self.started_at.get(), &self.title());
+        let out =
+            match crate::library::reserve_folder(&output_dir(self.started_at.get(), &self.title()))
+            {
+                Ok(out) => out,
+                Err(error) => {
+                    self.finished(
+                    false,
+                    Err(format!(
+                        "could not create meeting folder: {error}. The recovery recording is kept"
+                    )),
+                );
+                    return;
+                }
+            };
         // The notes read from, as they stood when the recording stopped.
         let script = self.notes.text();
         if !self.showing_meeting_notes.get() {
@@ -2571,6 +2538,7 @@ impl Recorder {
             .unwrap_or((false, false));
             let manifest = Manifest {
                 title: this.title(),
+                calendar: this.calendar_meeting.borrow().clone(),
                 started_at: this.started_at.get(),
                 duration_secs: raw_duration(&staging),
                 format,
@@ -2586,203 +2554,31 @@ impl Recorder {
                 chapters: Vec::new(),
                 chapters_by: None,
             };
-            let _ = meeting::write(&out, &manifest);
+            let metadata = meeting::write(&out, &manifest)
+                .and_then(|_| crate::bookmarks::save_bookmarks(&out, &this.bookmarks.borrow()));
+            let metadata_saved = metadata.is_ok();
             if let Some(script) = script {
                 let _ = std::fs::write(out.join(crate::notes::NOTES_FILE), script);
             }
             *this.manifest.borrow_mut() = Some(manifest);
             *this.result_dir.borrow_mut() = Some(out);
 
-            let result = this
-                .run_transcription(Tracks::Raw(staging.clone()), language)
-                .await;
-            // The kept tracks are enough to transcribe again; the raw files can go.
-            if saved == (true, true) {
+            let result = match metadata {
+                Ok(()) => {
+                    this.run_transcription(Tracks::Raw(staging.clone()), language)
+                        .await
+                }
+                Err(error) => Err(format!(
+                    "could not save meeting details: {error}. Recovery files are kept"
+                )),
+            };
+            // Preserve recovery files if any part of the durable meeting failed.
+            if saved == (true, true) && metadata_saved {
                 let _ = std::fs::remove_dir_all(&staging);
             }
-            this.hold_animation(&result).await;
+            this.animation.set_running(false);
             this.finished(saved.0, result);
         });
-    }
-
-    /// Transcribes into `result_dir/transcript.md`, driving the animation.
-    async fn run_transcription(
-        &self,
-        tracks: Tracks,
-        language: &'static str,
-    ) -> Result<(), String> {
-        let Some(out) = self.result_dir.borrow().clone() else {
-            return Err("no meeting folder".into());
-        };
-        self.set_compact(false);
-        if self.animation_since.get().is_none() {
-            self.animation_since.set(Some(std::time::Instant::now()));
-        }
-        self.set_state(State::Transcribing);
-        self.animation.reset();
-        self.animation.set_stage("Loading audio");
-        self.animation.set_progress(0.0);
-        self.animation.set_running(true);
-
-        let abort = Abort::default();
-        *self.abort.borrow_mut() = Some(abort.clone());
-        let (events_tx, events_rx) = async_channel::unbounded::<Event>();
-        let (done_tx, done_rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
-            let result = match tracks {
-                Tracks::Single(path, speakers) => transcribe::load_track(&path).and_then(|track| {
-                    transcribe::transcribe_single(&track, language, speakers, &events_tx, &abort)
-                }),
-                Tracks::Raw(dir) | Tracks::Kept(dir) => {
-                    let (mic_path, computer_path) = if dir.join("mic.raw").exists() {
-                        (dir.join("mic.raw"), dir.join("system.raw"))
-                    } else {
-                        export::tracks(&dir)
-                    };
-                    transcribe::load_track(&mic_path).and_then(|mic| {
-                        let computer = transcribe::load_track(&computer_path)?;
-                        transcribe::transcribe(&mic, &computer, language, &events_tx, &abort)
-                    })
-                }
-            };
-            let _ = done_tx.send_blocking(result);
-            let _ = events_tx.send_blocking(Event::Finished);
-        });
-
-        while let Ok(event) = events_rx.recv().await {
-            match event {
-                Event::Stage(stage) => self.animation.set_stage(&stage),
-                Event::Progress(progress) => {
-                    self.animation.set_progress(progress);
-                    self.shared.lock().unwrap().progress = progress;
-                }
-                Event::Segment(text) => {
-                    // The transcription labels speakers You/Remote or Speaker N;
-                    // show this meeting's names.
-                    let text = match (self.manifest.borrow().as_ref(), text.split_once(": ")) {
-                        (Some(m), Some((label, rest))) => {
-                            let labels = m.default_labels();
-                            match labels.iter().position(|l| l == label) {
-                                Some(i) if i < m.speakers.len() => {
-                                    format!("{}: {rest}", m.speakers[i])
-                                }
-                                _ => text.clone(),
-                            }
-                        }
-                        _ => text.clone(),
-                    };
-                    self.animation.push_text(&text);
-                }
-                Event::Finished => break,
-            }
-        }
-        let result = done_rx
-            .recv()
-            .await
-            .unwrap_or_else(|_| Err("transcription stopped unexpectedly".into()));
-        *self.abort.borrow_mut() = None;
-
-        let transcript = result?;
-        // The name as it is now; it may have been edited while transcribing.
-        let out = self.result_dir.borrow().clone().unwrap_or(out);
-        let date = glib::DateTime::from_unix_local(self.started_at.get())
-            .and_then(|t| t.format("%Y-%m-%d %H:%M"))
-            .map(|s| s.to_string())
-            .unwrap_or_default();
-        let mut markdown = transcribe::to_markdown(&self.title(), &date, &transcript);
-        if let Some(manifest) = self.manifest.borrow_mut().as_mut() {
-            // An import finds its own number of speakers; keep names already
-            // given and number the rest.
-            if manifest.imported.is_some() {
-                let found = speakers_in(&markdown);
-                let mut names = manifest.speakers.clone();
-                names.resize_with(found.len(), String::new);
-                for (i, name) in names.iter_mut().enumerate() {
-                    if name.is_empty() {
-                        *name = format!("Speaker {}", i + 1);
-                    }
-                }
-                manifest.speakers = names;
-            } else {
-                // A recording: You, or You 1, You 2, ... when several people
-                // share the mic, then Remote or Remote 1, Remote 2, ... Keep
-                // the names already given to a label; a new one gets a default.
-                let mut labels: Vec<String> = speakers_in(&markdown)
-                    .into_iter()
-                    .filter(|l| meeting::side_of(l).is_some())
-                    .collect();
-                labels.sort_by_key(|l| {
-                    let (side, n) = meeting::side_of(l).unwrap_or(("", 0));
-                    (side != meeting::DEFAULT_YOU, n)
-                });
-                if !labels.is_empty() {
-                    let known: std::collections::HashMap<String, String> = manifest
-                        .default_labels()
-                        .into_iter()
-                        .zip(manifest.speakers.iter().cloned())
-                        .collect();
-                    let names = labels
-                        .iter()
-                        .map(|label| {
-                            if let Some(name) = known.get(label) {
-                                return name.clone();
-                            }
-                            // One voice where there were several: the name of the first.
-                            if let Some(name) = known.get(&format!("{label} 1")) {
-                                return name.clone();
-                            }
-                            match meeting::side_of(label) {
-                                // The first voice on the mic is you.
-                                Some((side, 1)) => {
-                                    known.get(side).cloned().unwrap_or_else(|| label.clone())
-                                }
-                                Some((side, n)) if side == meeting::DEFAULT_YOU => {
-                                    format!("Room {n}")
-                                }
-                                _ => label.clone(),
-                            }
-                        })
-                        .collect();
-                    manifest.labels = labels;
-                    manifest.speakers = names;
-                }
-            }
-            // The transcription labels speakers You/Remote or Speaker N; use
-            // the names of this meeting.
-            let renames: Vec<(String, String)> = manifest
-                .default_labels()
-                .into_iter()
-                .zip(manifest.speakers.iter().cloned())
-                .filter(|(label, name)| label != name)
-                .collect();
-            markdown = meeting::relabel_all(&markdown, &renames);
-            manifest.language = language.to_owned();
-            manifest.model = Some(crate::models::configured());
-            manifest.title = self.title();
-            // Chapters of a previous transcript would point at lines that are gone.
-            manifest.chapters.clear();
-            manifest.chapters_by = None;
-            let _ = meeting::write(&out, manifest);
-        }
-        std::fs::write(out.join("transcript.md"), markdown)
-            .map_err(|e| format!("could not write the transcript: {e}"))
-    }
-
-    /// Keeps the animation on screen for at least ten seconds, also after a
-    /// short recording, so it reads as a step rather than a flicker. Skipped
-    /// when it was cancelled or the window is already gone.
-    async fn hold_animation(&self, result: &Result<(), String>) {
-        const MINIMUM: Duration = Duration::from_secs(10);
-        if let Some(since) = self.animation_since.take() {
-            let shown = since.elapsed();
-            let cancelled = matches!(result, Err(message) if message == CANCELLED);
-            if shown < MINIMUM && !cancelled && self.window.is_visible() {
-                self.animation.set_progress(1.0);
-                self.animation.set_stage("Done");
-                glib::timeout_future(MINIMUM - shown).await;
-            }
-        }
-        self.animation.set_running(false);
     }
 
     fn finished(self: &Rc<Self>, audio_ok: bool, transcript: Result<(), String>) {
@@ -2794,14 +2590,49 @@ impl Recorder {
         // Follow a name that was edited while the transcription ran.
         self.apply_title();
 
-        let problem = match (&transcript, audio_ok) {
-            (Err(message), _) if message == CANCELLED => {
-                Some("Transcription cancelled.".to_owned())
+        let fresh = self.fresh_transcript.replace(false) && transcript.is_ok();
+        let problem =
+            self.capture_problem
+                .borrow()
+                .clone()
+                .or_else(|| match (&transcript, audio_ok) {
+                    (Err(message), _) if message == CANCELLED => {
+                        Some("Transcription cancelled.".to_owned())
+                    }
+                    (Err(message), _) => Some(format!("Transcription failed: {message}.")),
+                    (Ok(()), false) => Some("Could not save the audio.".to_owned()),
+                    _ => None,
+                });
+        if let Some(dir) = self.result_dir.borrow().as_ref() {
+            if let Err(error) = crate::library::completed(dir, problem.as_deref()) {
+                self.toast(&format!("Could not save processing status: {error}"));
             }
-            (Err(message), _) => Some(format!("Transcription failed: {message}.")),
-            (Ok(()), false) => Some("Could not save the audio.".to_owned()),
-            _ => None,
-        };
+            if !self.window.is_active()
+                && !matches!(&transcript, Err(message) if message == CANCELLED)
+                && let Some(app) = self.window.application()
+            {
+                let notification = gio::Notification::new(if problem.is_some() {
+                    "Meeting needs attention"
+                } else {
+                    "Transcript ready"
+                });
+                notification.set_body(Some(&self.title()));
+                notification.set_default_action_and_target_value(
+                    "app.open-meeting",
+                    Some(&dir.to_string_lossy().to_variant()),
+                );
+                app.send_notification(
+                    Some(&format!("meeting-{}", self.started_at.get())),
+                    &notification,
+                );
+            }
+        }
+        if let Some(hub) = self.hub.upgrade()
+            && let Some(home) = hub.home.get()
+        {
+            home.refresh();
+            home.update_jobs();
+        }
         let text = self
             .result_dir
             .borrow()
@@ -2812,53 +2643,41 @@ impl Recorder {
         }
         self.show_transcript(text.as_deref(), problem.as_deref());
         self.transcript_scroll.vadjustment().set_value(0.0);
-        let actions_follow = problem.is_none() && !crate::actions::automatic().is_empty();
-        if let Some(problem) = problem {
+        let actions_follow =
+            fresh && problem.is_none() && !crate::actions::automatic().is_empty();
+        if let Some(problem) = &problem {
             eprintln!("{APP_NAME}: {problem}");
         } else {
             self.window.set_default_widget(Some(&self.copy_button));
             self.copy_button.grab_focus();
+        }
+        if fresh {
             // Your automatic actions run on a fresh transcript, after the
             // chapters when there are any, so they see the whole meeting.
             if actions_follow {
                 *self.auto_actions_due.borrow_mut() = self.result_dir.borrow().clone();
             }
-            // A fresh transcript gets chapters when an agent is around.
-            if self.can_have_chapters() {
+            if problem.is_none() && self.can_have_chapters() {
                 self.generate_chapters();
             } else {
                 self.run_automatic_actions();
             }
         }
         // A window closed while busy goes now, or once its automatic actions
-        // are done: quitting first would kill them halfway or before they start.
+        // are done: closing first would kill them halfway or before they start.
         if !actions_follow {
             self.close_if_asked();
         }
     }
 
-    /// Closes a window that was closed while it was busy, now that it is done.
+    /// Closes a window that was closed while it was busy, now that it is done;
+    /// the app goes with it when nothing else is on screen or busy.
     fn close_if_asked(self: &Rc<Self>) {
-        if self.quit_when_done.get()
-            && let Some(app) = self.window.application()
-        {
-            // Closed while busy: now it is done, it goes. The app goes with it
-            // unless another window is still open.
-            let others = self
-                .hub
-                .upgrade()
-                .map(|hub| {
-                    hub.recorders()
-                        .into_iter()
-                        .filter(|r| !Rc::ptr_eq(r, self))
-                        .count()
-                })
-                .unwrap_or(0);
-            if others > 0 {
-                self.window.destroy();
-            } else {
-                app.quit();
-            }
+        if self.quit_when_done.get() {
+            self.window.destroy();
+        }
+        if let Some(hub) = self.hub.upgrade() {
+            hub.settle_windows();
         }
     }
 
@@ -2892,6 +2711,7 @@ impl Recorder {
             let _ = meeting::write(&dir, &manifest);
         }
 
+        self.invalidate_chapters();
         self.loading.set(true);
         if let Some(i) = Format::ALL.iter().position(|f| *f == manifest.format) {
             self.format_row.set_selected(i as u32);
@@ -2905,18 +2725,24 @@ impl Recorder {
         self.loading.set(false);
 
         self.started_at.set(manifest.started_at);
+        if self.result_dir.borrow().as_ref() != Some(&dir) {
+            *self.capture_problem.borrow_mut() = None;
+        }
+        self.set_calendar_meeting(manifest.calendar.clone());
         set_name(&self.title_row, &manifest.title);
         set_name(&self.done_title_row, &manifest.title);
         *self.manifest.borrow_mut() = Some(manifest);
         *self.result_dir.borrow_mut() = Some(dir.clone());
+        self.fresh_transcript.set(false);
         self.set_state(State::Done);
         self.show_meeting_notes(&dir);
         let text = std::fs::read_to_string(dir.join("transcript.md")).ok();
-        let problem = text
-            .is_none()
-            .then_some("This meeting has no transcript yet.");
+        let problem = crate::library::problem(&dir).or_else(|| {
+            text.is_none()
+                .then(|| "This meeting has no transcript yet. Use Transcribe again below.".into())
+        });
         self.player.load(&dir);
-        self.show_transcript(text.as_deref(), problem);
+        self.show_transcript(text.as_deref(), problem.as_deref());
         self.transcript_scroll.vadjustment().set_value(0.0);
         // Never leave the focus in the name: typing would rename the meeting.
         self.window.set_default_widget(Some(&self.copy_button));
@@ -2937,7 +2763,8 @@ impl Recorder {
             "dialog-warning-symbolic"
         }));
         self.copy_button.set_sensitive(markdown.is_some());
-        self.actions_button.set_sensitive(markdown.is_some());
+        self.actions_button
+            .set_sensitive(markdown.is_some() && self.state.get() == State::Done);
         self.refresh_actions();
 
         while let Some(row) = self.transcript_list.row_at_index(0) {
@@ -3041,6 +2868,7 @@ impl Recorder {
         );
         self.show_chapters(&chapters);
         self.show_speakers();
+        self.refresh_bookmarks();
         let meta = meta.join("  ·  ");
         self.done_meta.set_label(&meta);
         self.done_meta.set_visible(!meta.is_empty());
@@ -3090,8 +2918,9 @@ impl Recorder {
             .set_visible(agent.is_some() || has_chapters);
         self.chapters_button.set_visible(agent.is_some());
         self.chapters_spinner.set_visible(self.generating.get());
-        self.chapters_button
-            .set_sensitive(!self.generating.get() && self.can_have_chapters());
+        self.chapters_button.set_sensitive(
+            self.state.get() == State::Done && !self.generating.get() && self.can_have_chapters(),
+        );
         self.chapters_button
             .set_label(if has_chapters { "Redo" } else { "Generate" });
         let description = match &agent {
@@ -3107,404 +2936,6 @@ impl Recorder {
         };
         self.chapters_group
             .set_description((!description.is_empty()).then_some(description.as_str()));
-    }
-
-    /// Asks the default agent for chapters in the background. The meeting
-    /// works the same without them; a failure only shows up in the header.
-    fn generate_chapters(self: &Rc<Self>) {
-        if self.generating.get() {
-            self.run_automatic_actions();
-            return;
-        }
-        let (Some(agent), Some(dir)) = (self.default_agent(), self.result_dir.borrow().clone())
-        else {
-            self.run_automatic_actions();
-            return;
-        };
-        let lines = self.lines.borrow().clone();
-        self.generating.set(true);
-        self.update_chapters_header(!self.chapter_starts.borrow().is_empty());
-        let this = self.clone();
-        glib::spawn_future_local(async move {
-            let asked = agent.clone();
-            let result = gio::spawn_blocking(move || {
-                let lines: Vec<chapters::Line> = lines
-                    .iter()
-                    .map(|(start_ms, speaker, text)| chapters::Line {
-                        start_ms: *start_ms,
-                        speaker,
-                        text,
-                    })
-                    .collect();
-                chapters::generate(&asked, &lines)
-            })
-            .await
-            .unwrap_or_else(|_| Err("the agent stopped unexpectedly".into()));
-            this.generating.set(false);
-            // The folder may have been renamed meanwhile (same timestamp
-            // prefix); a different meeting is left alone.
-            let prefix = |p: &std::path::Path| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| n.chars().take(12).collect::<String>())
-            };
-            let current = this.result_dir.borrow().clone();
-            let Some(dir) = current.filter(|d| prefix(d) == prefix(&dir)) else {
-                this.run_automatic_actions();
-                return;
-            };
-            match result {
-                Ok(list) => this.store_chapters(&dir, &list, &agent),
-                Err(message) => {
-                    eprintln!("{APP_NAME}: chapters: {message}");
-                    this.update_chapters_header(!this.chapter_starts.borrow().is_empty());
-                    this.chapters_group
-                        .set_description(Some(&format!("{} could not make chapters", agent.name)));
-                }
-            }
-            // With or without chapters, the meeting is now as complete as it
-            // gets: the automatic actions can have it.
-            this.run_automatic_actions();
-        });
-    }
-
-    fn store_chapters(self: &Rc<Self>, dir: &std::path::Path, list: &[Chapter], agent: &Agent) {
-        if let Some(manifest) = self.manifest.borrow_mut().as_mut() {
-            manifest.chapters = list.to_vec();
-            manifest.chapters_by = Some(agent.id.clone());
-            let _ = meeting::write(dir, manifest);
-        }
-        let transcript = dir.join("transcript.md");
-        if let Ok(text) = std::fs::read_to_string(&transcript) {
-            let _ = std::fs::write(&transcript, chapters::apply_to_markdown(&text, list));
-        }
-        let text = std::fs::read_to_string(&transcript).ok();
-        self.show_transcript(text.as_deref(), None);
-        self.toast(&format!("{} chapters added", list.len()));
-    }
-
-    /// One paragraph of the transcript: time, speaker and text in columns, with
-    /// edit, swap-speaker and delete buttons that show on hover.
-    fn paragraph_row(
-        self: &Rc<Self>,
-        paragraph: &Paragraph,
-        speaker_index: usize,
-        time_width: i32,
-        speaker_width: i32,
-    ) -> gtk::ListBoxRow {
-        let time = gtk::Label::builder()
-            .label(&paragraph.time)
-            .xalign(0.0)
-            .valign(gtk::Align::Start)
-            .width_request(time_width)
-            .css_classes(["numeric", "dim-label"])
-            .build();
-        let speaker = gtk::Label::builder()
-            .label(&paragraph.speaker)
-            .xalign(0.0)
-            .valign(gtk::Align::Start)
-            .width_request(speaker_width)
-            .css_classes([format!("speaker-{}", speaker_index % 6)])
-            .build();
-        let text = gtk::Label::builder()
-            .label(&paragraph.text)
-            .xalign(0.0)
-            .valign(gtk::Align::Start)
-            .hexpand(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::WordChar)
-            .natural_wrap_mode(gtk::NaturalWrapMode::None)
-            .build();
-        let action = |icon: &str, tooltip: &str| {
-            gtk::Button::builder()
-                .icon_name(icon)
-                .tooltip_text(tooltip)
-                .valign(gtk::Align::Start)
-                .css_classes(["flat", "circular"])
-                .build()
-        };
-        let edit = action("document-edit-symbolic", "Edit this line");
-        let swap = action("object-flip-horizontal-symbolic", "Next speaker");
-        let delete = action("user-trash-symbolic", "Delete this line");
-        let actions = gtk::Box::builder()
-            .spacing(2)
-            .valign(gtk::Align::Start)
-            .css_classes(["row-actions"])
-            .build();
-        actions.append(&edit);
-        actions.append(&swap);
-        actions.append(&delete);
-
-        let content = gtk::Box::builder().spacing(14).build();
-        content.append(&time);
-        content.append(&speaker);
-        content.append(&text);
-        content.append(&actions);
-        let row = gtk::ListBoxRow::builder()
-            .child(&content)
-            .tooltip_text(format!("Play from {}", paragraph.time))
-            .build();
-        row.set_cursor_from_name(Some("pointer"));
-
-        let (sources, stamp, who) = (
-            paragraph.sources.clone(),
-            paragraph.time.clone(),
-            paragraph.speaker.clone(),
-        );
-        let weak = Rc::downgrade(self);
-        let delete_sources = sources.clone();
-        delete.connect_clicked(move |_| {
-            if let Some(r) = weak.upgrade() {
-                r.delete_paragraph(&delete_sources);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        let (swap_sources, swap_who) = (sources.clone(), who.clone());
-        swap.connect_clicked(move |_| {
-            if let Some(r) = weak.upgrade() {
-                r.swap_speaker(&swap_sources, &swap_who);
-            }
-        });
-        let weak = Rc::downgrade(self);
-        let original = paragraph.text.clone();
-        let (edit_content, edit_speaker, edit_row) =
-            (content.clone(), speaker.clone(), row.clone());
-        edit.connect_clicked(move |button| {
-            let Some(r) = weak.upgrade() else { return };
-            r.start_editing(
-                &edit_row,
-                &edit_content,
-                &edit_speaker,
-                &text,
-                button,
-                &sources,
-                &stamp,
-                &who,
-                &original,
-            );
-        });
-        row
-    }
-
-    /// Swaps the text of a row for an editor: Enter saves, Escape cancels,
-    /// leaving the field saves too.
-    #[allow(clippy::too_many_arguments)]
-    fn start_editing(
-        self: &Rc<Self>,
-        row: &gtk::ListBoxRow,
-        content: &gtk::Box,
-        speaker: &gtk::Label,
-        label: &gtk::Label,
-        edit_button: &gtk::Button,
-        sources: &[usize],
-        time: &str,
-        who: &str,
-        original: &str,
-    ) {
-        row.set_activatable(false);
-        row.add_css_class("editing");
-        // Start at the size of the text it replaces: without a width the first
-        // frame wraps every letter and the field flashes up very tall.
-        let (width, height) = (label.width().max(120), label.height().max(1));
-        label.set_visible(false);
-        edit_button.set_sensitive(false);
-        let editor = gtk::TextView::builder()
-            .wrap_mode(gtk::WrapMode::WordChar)
-            .hexpand(true)
-            .valign(gtk::Align::Start)
-            .width_request(width)
-            .height_request(height)
-            .css_classes(["transcript-editor"])
-            .build();
-        editor.buffer().set_text(original);
-        content.insert_child_after(&editor, Some(speaker));
-        editor.grab_focus();
-
-        let done = Rc::new(Cell::new(false));
-        let finish = {
-            let (weak, editor, label, row, button) = (
-                Rc::downgrade(self),
-                editor.clone(),
-                label.clone(),
-                row.clone(),
-                edit_button.clone(),
-            );
-            let (sources, time, who, original) = (
-                sources.to_vec(),
-                time.to_owned(),
-                who.to_owned(),
-                original.to_owned(),
-            );
-            let done = done.clone();
-            move |save: bool| {
-                if done.replace(true) {
-                    return;
-                }
-                let buffer = editor.buffer();
-                let text = buffer
-                    .text(&buffer.start_iter(), &buffer.end_iter(), false)
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if let Some(parent) = editor.parent().and_downcast::<gtk::Box>() {
-                    parent.remove(&editor);
-                }
-                label.set_visible(true);
-                row.set_activatable(true);
-                row.remove_css_class("editing");
-                button.set_sensitive(true);
-                if save
-                    && text != original
-                    && let Some(r) = weak.upgrade()
-                {
-                    // Deferred: saving rebuilds the list this row lives in.
-                    let (sources, time, who) = (sources.clone(), time.clone(), who.clone());
-                    glib::idle_add_local_once(move || {
-                        if text.is_empty() {
-                            r.delete_paragraph(&sources);
-                        } else {
-                            r.edit_paragraph(&sources, &time, &who, &text);
-                        }
-                    });
-                }
-            }
-        };
-        let finish = Rc::new(finish);
-        let keys = gtk::EventControllerKey::new();
-        let on_key = finish.clone();
-        keys.connect_key_pressed(move |_, key, _, modifiers| match key {
-            gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter
-                if !modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) =>
-            {
-                on_key(true);
-                glib::Propagation::Stop
-            }
-            gtk::gdk::Key::Escape => {
-                on_key(false);
-                glib::Propagation::Stop
-            }
-            _ => glib::Propagation::Proceed,
-        });
-        editor.add_controller(keys);
-        let focus = gtk::EventControllerFocus::new();
-        let on_leave = finish.clone();
-        focus.connect_leave(move |_| on_leave(true));
-        editor.add_controller(focus);
-    }
-
-    /// Changes transcript.md line by line and shows the result, keeping the
-    /// scroll position. Returns the text as it was, for undo.
-    fn rewrite_transcript(
-        self: &Rc<Self>,
-        change: impl FnOnce(&mut Vec<String>),
-    ) -> Option<String> {
-        let dir = self.result_dir.borrow().clone()?;
-        let path = dir.join("transcript.md");
-        let before = std::fs::read_to_string(&path).ok()?;
-        let mut lines: Vec<String> = before.lines().map(str::to_owned).collect();
-        change(&mut lines);
-        // Removing lines leaves their blank separators behind; keep one.
-        let mut tidy: Vec<String> = Vec::new();
-        for line in lines {
-            if line.trim().is_empty() && tidy.last().is_some_and(|l| l.trim().is_empty()) {
-                continue;
-            }
-            tidy.push(line);
-        }
-        let after = tidy.join("\n") + "\n";
-        if std::fs::write(&path, &after).is_err() {
-            self.toast("Could not save the transcript");
-            return None;
-        }
-        self.redraw_transcript(&after);
-        Some(before)
-    }
-
-    fn redraw_transcript(self: &Rc<Self>, markdown: &str) {
-        let adjustment = self.transcript_scroll.vadjustment();
-        let scroll = adjustment.value();
-        self.show_transcript(Some(markdown), None);
-        glib::idle_add_local_once(move || adjustment.set_value(scroll));
-    }
-
-    fn edit_paragraph(self: &Rc<Self>, sources: &[usize], time: &str, who: &str, text: &str) {
-        let (first, rest) = match sources.split_first() {
-            Some(split) => split,
-            None => return,
-        };
-        let (first, rest) = (*first, rest.to_vec());
-        let line = format!("**[{time}] {who}:** {text}");
-        if self
-            .rewrite_transcript(move |lines| {
-                if let Some(slot) = lines.get_mut(first) {
-                    *slot = line;
-                }
-                for index in rest.into_iter().rev() {
-                    if index < lines.len() {
-                        lines.remove(index);
-                    }
-                }
-            })
-            .is_some()
-        {
-            self.toast("Saved");
-        }
-    }
-
-    fn delete_paragraph(self: &Rc<Self>, sources: &[usize]) {
-        let mut sources = sources.to_vec();
-        sources.sort_unstable();
-        let Some(before) = self.rewrite_transcript(move |lines| {
-            for index in sources.into_iter().rev() {
-                if index < lines.len() {
-                    lines.remove(index);
-                }
-            }
-        }) else {
-            return;
-        };
-        let toast = adw::Toast::builder()
-            .title("Line deleted")
-            .button_label("Undo")
-            .build();
-        let weak = Rc::downgrade(self);
-        toast.connect_button_clicked(move |_| {
-            let Some(r) = weak.upgrade() else { return };
-            if let Some(dir) = r.result_dir.borrow().clone()
-                && std::fs::write(dir.join("transcript.md"), &before).is_ok()
-            {
-                r.redraw_transcript(&before);
-            }
-        });
-        self.toasts.add_toast(toast);
-    }
-
-    /// Gives a paragraph to the other speaker, for when whisper guessed wrong.
-    fn swap_speaker(self: &Rc<Self>, sources: &[usize], who: &str) {
-        let speakers = self
-            .manifest
-            .borrow()
-            .as_ref()
-            .map(|m| m.people())
-            .unwrap_or_default();
-        if speakers.len() < 2 {
-            return;
-        }
-        let next = speakers
-            .iter()
-            .position(|s| s == who)
-            .map_or(0, |i| (i + 1) % speakers.len());
-        let other = speakers[next].clone();
-        let sources = sources.to_vec();
-        self.rewrite_transcript(move |lines| {
-            for index in sources {
-                if let Some(line) = lines.get_mut(index)
-                    && let Some((time, _, text)) = parse_segment(line)
-                {
-                    *line = format!("**[{time}] {other}:** {text}");
-                }
-            }
-        });
     }
 
     /// Ctrl+F on the done page: show the bar and select whatever was typed last.
@@ -3801,19 +3232,26 @@ impl Recorder {
                 renames.push((from.clone(), to.clone()));
             }
         }
-        let transcript = dir.join("transcript.md");
-        if let Ok(text) = std::fs::read_to_string(&transcript) {
-            let _ = std::fs::write(&transcript, meeting::relabel_all(&text, &renames));
-        }
         let you_changed = manifest.imported.is_none() && names.first() != manifest.speakers.first();
-        if let Some(m) = self.manifest.borrow_mut().as_mut() {
-            m.speakers = names.clone();
-            let _ = meeting::write(&dir, m);
-        }
+        let mut updated = manifest;
+        updated.speakers = names.clone();
+        let result = meeting::read_transcript(&dir).and_then(|text| {
+            let text = text.map(|text| meeting::relabel_all(&text, &renames));
+            meeting::update(&dir, &updated, text.as_deref())?;
+            Ok(text)
+        });
+        let text = match result {
+            Ok(text) => text,
+            Err(error) => {
+                self.toast(&format!("Could not save speaker names: {error}"));
+                self.show_speakers();
+                return;
+            }
+        };
+        *self.manifest.borrow_mut() = Some(updated);
         if you_changed && let Some(you) = names.first() {
             settings::save_your_name(you);
         }
-        let text = std::fs::read_to_string(&transcript).ok();
         self.redraw_transcript(text.as_deref().unwrap_or(""));
         if merged {
             self.toast("Merged into one speaker");
@@ -3831,7 +3269,11 @@ impl Recorder {
             return;
         };
         let title = self.title();
-        let target = output_dir(self.started_at.get(), &title);
+        let name = output_dir(self.started_at.get(), &title);
+        let target = current
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(name.file_name().unwrap_or_default());
         // "202609241400 Weekly 2" is still the folder of "Weekly": an import
         // got a number when the name was taken. Only a new name renames.
         let renamed = !folder_is_for(&current, &target);
@@ -3851,24 +3293,29 @@ impl Recorder {
         }
         // The folder the meeting is in now: renamed, or the numbered one it had.
         let target = if renamed { target } else { current };
-        let mut retitled = false;
-        if let Some(manifest) = self.manifest.borrow_mut().as_mut()
-            && manifest.title != title
-        {
-            manifest.title = title.clone();
-            let _ = meeting::write(&target, manifest);
-            retitled = true;
-        }
-        if !renamed && !retitled {
+        let Some(mut manifest) = self.manifest.borrow().clone() else {
+            return;
+        };
+        if !renamed && manifest.title == title {
             return;
         }
-        let transcript = target.join("transcript.md");
-        if let Ok(text) = std::fs::read_to_string(&transcript)
-            && let Some(rest) = text.strip_prefix("# ")
-        {
-            let body = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
-            let _ = std::fs::write(&transcript, format!("# {title}\n{body}"));
+        manifest.title = title.clone();
+        let result = meeting::read_transcript(&target).and_then(|text| {
+            let text = text.map(|text| {
+                if let Some(rest) = text.strip_prefix("# ") {
+                    let body = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
+                    format!("# {title}\n{body}")
+                } else {
+                    text
+                }
+            });
+            meeting::update(&target, &manifest, text.as_deref())
+        });
+        if let Err(error) = result {
+            self.toast(&format!("Could not save meeting title: {error}"));
+            return;
         }
+        *self.manifest.borrow_mut() = Some(manifest);
         self.toast("Saved");
     }
 
@@ -3947,9 +3394,7 @@ fn output_dir(started_at: i64, title: &str) -> PathBuf {
         .and_then(|t| t.format("%Y%m%d%H%M"))
         .map(|s| s.to_string())
         .unwrap_or_default();
-    glib::home_dir()
-        .join("Documents/Meetings")
-        .join(format!("{stamp} {}", safe_name(title)))
+    crate::library::root().join(format!("{stamp} {}", safe_name(title)))
 }
 
 fn row_count(list: &gtk::ListBox) -> i32 {
@@ -4237,6 +3682,7 @@ fn import_audio(
 #[derive(Clone)]
 struct RecordingNote {
     title: String,
+    calendar: Option<crate::calendar::Meeting>,
     started_at: i64,
     format: Format,
     language: String,
@@ -4248,20 +3694,24 @@ fn write_recording_note(
     started_at: i64,
     format: Format,
     language: &str,
+    calendar: Option<&crate::calendar::Meeting>,
 ) {
     let note = serde_json::json!({
         "title": title,
+        "calendar": calendar,
         "started_at": started_at,
         "format": format.key(),
         "language": language,
     });
-    let _ = std::fs::write(staging.join("recording.json"), note.to_string());
+    let _ =
+        crate::bookmarks::atomic_write(&staging.join("recording.json"), note.to_string().as_bytes());
 }
 
 fn read_recording_note(staging: &std::path::Path) -> Option<RecordingNote> {
     let text = std::fs::read_to_string(staging.join("recording.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     Some(RecordingNote {
+        calendar: serde_json::from_value(value["calendar"].clone()).ok(),
         title: value["title"]
             .as_str()
             .filter(|t| !t.is_empty())?
@@ -4312,26 +3762,7 @@ fn speakers_in(markdown: &str) -> Vec<String> {
     found
 }
 
-/// `01:23` or `1:02:03` to milliseconds.
-fn clock_to_ms(clock: &str) -> i64 {
-    clock
-        .split(':')
-        .filter_map(|part| part.parse::<i64>().ok())
-        .fold(0, |total, part| total * 60 + part)
-        * 1000
-}
-
-/// Splits `**[01:23] You:** text` into its time, speaker and text.
-fn parse_segment(line: &str) -> Option<(&str, &str, &str)> {
-    let rest = line.strip_prefix("**[")?;
-    let (time, rest) = rest.split_once("] ")?;
-    let (speaker, text) = rest.split_once(":** ")?;
-    Some((time, speaker, text.trim()))
-}
-
-/// The few styles libadwaita does not have: a see-through header bar over the
-/// animation, the transcript card, and the device menus as quiet as the
-/// values of the rows above them.
+/// Shared styles for the recorder and transcript.
 fn load_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
@@ -4529,5 +3960,48 @@ mod tests {
         assert_eq!(super::unclaimed_window(&clients, 7, &[]), Some("0xb".into()));
         assert_eq!(super::unclaimed_window(&clients, 7, &["0xb".into()]), Some("0xa".into()));
         assert_eq!(super::unclaimed_window(&clients, 7, &["0xa".into(), "0xb".into()]), None);
+    }
+}
+
+#[cfg(test)]
+mod calendar_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_preserves_calendar_invitation_and_accepts_old_notes() {
+        let dir = std::env::temp_dir().join(format!(
+            "mr-calendar-recovery-{}",
+            glib::uuid_string_random()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meeting = crate::calendar::Meeting {
+            provider: "microsoft".into(),
+            id: "event-1".into(),
+            title: "Planning".into(),
+            starts_at: 100,
+            ends_at: 200,
+            participants: vec![crate::calendar::Person {
+                name: "Alex".into(),
+                email: "alex@example.com".into(),
+            }],
+        };
+        write_recording_note(
+            &dir,
+            "Renamed call",
+            123,
+            Format::Mono,
+            "en",
+            Some(&meeting),
+        );
+        let recovered = read_recording_note(&dir).unwrap();
+        assert_eq!(recovered.title, "Renamed call");
+        assert_eq!(recovered.calendar, Some(meeting));
+        std::fs::write(
+            dir.join("recording.json"),
+            r#"{"title":"Old call","started_at":123}"#,
+        )
+        .unwrap();
+        assert!(read_recording_note(&dir).unwrap().calendar.is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -18,7 +18,7 @@
 //! transcript is done (and its chapters, when an agent writes them).
 
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::meeting::Manifest;
 
@@ -27,7 +27,7 @@ use crate::meeting::Manifest;
 pub const DOCS: &str =
     "https://github.com/jankeesvw/omarchy-meeting-recorder/blob/main/docs/actions.md";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Action {
     pub name: String,
     pub command: String,
@@ -35,87 +35,13 @@ pub struct Action {
     pub auto: bool,
 }
 
-/// The actions in the config file, in its order. Read every time, so an edit
-/// shows up without restarting the app.
-pub fn load() -> Vec<Action> {
-    std::fs::read_to_string(crate::models::config_file())
-        .map(|text| parse(&text))
-        .unwrap_or_default()
-}
+mod config;
+pub use config::{load, read, remove, save};
 
 /// The actions that run on their own when a transcript is done, in the order
 /// of the config file.
 pub fn automatic() -> Vec<Action> {
     load().into_iter().filter(|a| a.auto).collect()
-}
-
-/// The `[[action]]` tables of a config file. A line format rather than a full
-/// TOML parser: `key = "value"` pairs, `#` comments, nothing nested.
-fn parse(text: &str) -> Vec<Action> {
-    let mut actions = Vec::new();
-    let mut current: Option<Action> = None;
-    let mut finish = |current: &mut Option<Action>| {
-        if let Some(action) = current.take()
-            && !action.name.is_empty()
-            && !action.command.is_empty()
-        {
-            actions.push(action);
-        }
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            finish(&mut current);
-            if line == "[[action]]" {
-                current = Some(Action {
-                    name: String::new(),
-                    command: String::new(),
-                    auto: false,
-                });
-            }
-            continue;
-        }
-        let Some(action) = current.as_mut() else {
-            continue;
-        };
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = unquote(value.trim());
-        match key.trim() {
-            "name" => action.name = value,
-            "command" => action.command = value,
-            "auto" => action.auto = value == "true",
-            _ => {}
-        }
-    }
-    finish(&mut current);
-    actions
-}
-
-/// A TOML string: `"..."` with backslash escapes, or `'...'` taken literally.
-fn unquote(value: &str) -> String {
-    if let Some(inner) = value.strip_prefix('\'').and_then(|v| v.split('\'').next()) {
-        return inner.to_owned();
-    }
-    let Some(rest) = value.strip_prefix('"') else {
-        return value.split('#').next().unwrap_or("").trim().to_owned();
-    };
-    let mut out = String::new();
-    let mut chars = rest.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => break,
-            '\\' => match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('t') => out.push('\t'),
-                Some(other) => out.push(other),
-                None => break,
-            },
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// How an action ended: the last thing it printed, and a link in it if any.
@@ -127,6 +53,15 @@ pub struct Outcome {
 /// Runs `action` on the meeting in `dir`. Blocking; the caller runs it off the
 /// main thread.
 pub fn run(action: &Action, dir: &Path, manifest: &Manifest) -> Result<Outcome, String> {
+    run_cancellable(action, dir, manifest, &crate::transcribe::Abort::default())
+}
+
+pub fn run_cancellable(
+    action: &Action,
+    dir: &Path,
+    manifest: &Manifest,
+    cancel: &crate::transcribe::Abort,
+) -> Result<Outcome, String> {
     let date = gtk::glib::DateTime::from_unix_local(manifest.started_at)
         .and_then(|t| t.format("%Y-%m-%d %H:%M"))
         .map(|s| s.to_string())
@@ -135,7 +70,8 @@ pub fn run(action: &Action, dir: &Path, manifest: &Manifest) -> Result<Outcome, 
         .iter()
         .map(|f| dir.join(f))
         .find(|p| p.exists());
-    let output = Command::new("sh")
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
         .arg(&action.command)
         .arg("meeting-action")
@@ -153,10 +89,18 @@ pub fn run(action: &Action, dir: &Path, manifest: &Manifest) -> Result<Outcome, 
         .env("MEETING_DURATION", manifest.duration_secs.to_string())
         .env("MEETING_LANGUAGE", &manifest.language)
         .env("MEETING_SPEAKERS", manifest.people().join("\n"))
-        .env("MEETING_AUDIO", audio.unwrap_or_default())
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| e.to_string())?;
+        .env("MEETING_CONTEXT", manifest.context_markdown())
+        .env(
+            "MEETING_INVITEES_JSON",
+            serde_json::to_string(manifest.invitees())
+                .map_err(|e| format!("Could not encode meeting invitees: {e}"))?,
+        )
+        .env("MEETING_AUDIO", audio.unwrap_or_default());
+    let output = crate::process::output(
+        &mut command,
+        cancel,
+        std::time::Duration::from_secs(30 * 60),
+    )?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -273,6 +217,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn actions_get_optional_provider_neutral_context_for_existing_transcripts() {
+        let root = std::env::temp_dir().join(format!("mr-action-context-{}", std::process::id()));
+        let dir = root.join("202610091000 Planning");
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = "# Planning\n\n## Transcript\n\n**[00:00] Remote:** Hi.\n";
+        std::fs::write(dir.join("transcript.md"), original).unwrap();
+        let (_, mut manifest) = crate::meeting::open(&dir).unwrap();
+        let action = Action {
+            name: "Capture context".into(),
+            command: r#"printf '%s' "$MEETING_CONTEXT" > context.md
+printf '%s' "$MEETING_INVITEES_JSON" > invitees.json
+printf '%s' "$MEETING_SPEAKERS" > speakers.txt"#
+                .into(),
+            auto: false,
+        };
+        for provider in [Some("microsoft"), Some("future-provider"), None] {
+            manifest.calendar = provider.map(|provider| crate::calendar::Meeting {
+                provider: provider.into(),
+                id: "local-snapshot".into(),
+                title: "Planning".into(),
+                starts_at: 100,
+                ends_at: 200,
+                participants: vec![crate::calendar::Person {
+                    name: "Zoë \"Example\" $(touch injected)".into(),
+                    email: "zoe@example.com".into(),
+                }],
+            });
+            crate::meeting::write(&dir, &manifest).unwrap();
+            // Exercise the same disk snapshot path used by manual and automatic runs.
+            let (_, saved) = crate::meeting::open(&dir).unwrap();
+            run(&action, &dir, &saved).unwrap();
+            let invitees: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("invitees.json")).unwrap())
+                    .unwrap();
+            assert_eq!(invitees, serde_json::json!(manifest.invitees()));
+            assert_eq!(
+                std::fs::read_to_string(dir.join("context.md")).unwrap(),
+                manifest.context_markdown()
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("speakers.txt")).unwrap(),
+                "You\nRemote"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.join("transcript.md")).unwrap(),
+                original
+            );
+            assert!(!dir.join("injected").exists());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn reads_actions_and_skips_the_rest() {
         let config = r#"
 model = "large-v3-turbo"  # not an action
@@ -297,7 +294,7 @@ name = "No command, ignored"
 name = "not an action"
 "#;
         assert_eq!(
-            parse(config),
+            config::parse(config).unwrap(),
             [
                 Action {
                     name: "Copy to Obsidian".into(),
@@ -316,7 +313,7 @@ name = "not an action"
                 },
             ]
         );
-        let parsed = parse(config);
+        let parsed = config::parse(config).unwrap();
         let automatic: Vec<&str> = parsed
             .iter()
             .filter(|a| a.auto)
@@ -330,6 +327,7 @@ name = "not an action"
         let dir = std::env::temp_dir().join(format!("mr-action-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let manifest = Manifest {
+            calendar: None,
             title: "Weekly".into(),
             started_at: 0,
             duration_secs: 60,

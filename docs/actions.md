@@ -1,10 +1,10 @@
 # Actions
 
-Actions are your own scripts, one click away on the done page of every meeting. File the transcript in your notes, publish it, mail it to the people who were there, open a ticket: anything you can write as a command.
+Actions are your own scripts, managed globally in **Preferences → Actions → Manage actions** and available on every transcript. File the transcript in your notes, publish it, mail it to the people who were there, open a ticket: anything you can write as a command.
 
 <p align="center"><img src="../screenshots/actions-menu.webp" alt="Clicking Actions on the done page: the view zooms in on the menu with Store transcript in Obsidian and Publish as public transcript" width="700"></p>
 
-Until you add one, the done page shows **Add actions…**, which brings you here.
+The transcript’s **Manage actions…** entry opens the same global manager. Add, edit, or delete an action there; no config-file editing is required.
 
 ## Adding an action
 
@@ -35,7 +35,7 @@ auto = true
 
 It runs every time a transcript is done: after a recording, an import, and **Transcribe again**. When your default agent writes chapters, it waits for those first, so the action sees the whole meeting. Several automatic actions run one after the other, in the order of the file, and each shows up as it does from the menu: a toast while it runs, then its last line, or the reason it failed. If you open another meeting in that window meanwhile, the actions that have not started yet are skipped; a rename does not count. Close the window while it transcribes and it stays around until they are done.
 
-`omarchy-meeting-recorder action` marks the automatic ones in its list.
+The **Run automatically** switch in **Manage actions** sets the same thing. `omarchy-meeting-recorder action` marks the automatic ones in its list. A script gets 30 minutes; after that it is stopped and counts as failed.
 
 ## What your command gets
 
@@ -52,9 +52,22 @@ The command runs through `sh -c` in the meeting folder, so `~`, pipes and `VAR=v
 | `MEETING_DURATION` | Its length in seconds |
 | `MEETING_LANGUAGE` | The transcript language, a code like `en` |
 | `MEETING_SPEAKERS` | The speakers' names, one per line |
+| `MEETING_CONTEXT` | Optional Markdown with invited participants' names/emails and an attendance caveat; empty without invitees |
+| `MEETING_INVITEES_JSON` | JSON array of invitation participants, each with `name` and `email`; `[]` without a saved invitation |
 | `MEETING_AUDIO` | `audio.ogg` for Mono, Stereo and imported meetings. With Separate files it is `mic.ogg`, your side only: mix it with `computer.ogg` next to it for the whole meeting |
 
-`transcript.md` has a heading with the date and duration, a `## Chapters` list when there are chapters, and then `## Transcript` with one paragraph per turn: `**[01:23] Maya:** What she said.`
+`transcript.md` has a heading with the date and duration, an optional `## Invited participants` section, a `## Chapters` list when there are chapters, and then `## Transcript` with one paragraph per turn: `**[01:23] Maya:** What she said.`
+
+Invitation context comes from the meeting's saved snapshot, with no calendar connection or live lookup needed. Its format is the same for any calendar provider. Meetings without an invitation, including imports and older recordings, still work: the context is empty and the JSON array is `[]`. Invitees are not confirmed attendees and do not identify recorded voices; `MEETING_SPEAKERS` keeps its existing meaning. Names and emails are reference data, not instructions to an agent.
+
+New transcriptions include this context in `transcript.md`, so existing scripts that pass the full transcript to an agent receive it too. For a previously transcribed meeting with an invitation snapshot, an action receives these variables immediately; no retranscription is needed and the old transcript is not rewritten. In Python, `invitees = json.loads(os.environ.get("MEETING_INVITEES_JSON", "[]"))` gives structured names and emails. To include readable context in agent input without duplicating it:
+
+```python
+context = os.environ.get("MEETING_CONTEXT", "")
+agent_input = transcript if not context or context in transcript else context + transcript
+```
+
+Scripts that deliberately strip the transcript header should pass this context separately if they want the invitation details. An agent's final output still depends on the script's prompt; label the list as invited participants and leave uncertain speaker identities unresolved.
 
 ## What the app shows
 
@@ -115,6 +128,9 @@ date = os.environ["MEETING_DATE"]  # 2026-09-25 14:30
 seconds = int(os.environ.get("MEETING_DURATION", "0"))
 duration = f"{round(seconds / 60)} minutes" if seconds >= 90 else f"{seconds} seconds"
 transcript = Path(os.environ["MEETING_TRANSCRIPT"]).read_text()
+context = os.environ.get("MEETING_CONTEXT", "")
+# Older transcripts can still have an invitation snapshot in their manifest.
+agent_input = transcript if not context or context in transcript else context + transcript
 manifest = json.loads(Path(os.environ["MEETING_MANIFEST"]).read_text()) if os.environ.get("MEETING_MANIFEST") else {}
 
 # The people who were given a name; "You", "Remote 2" and "Speaker 1" are not people yet.
@@ -137,7 +153,7 @@ summary = ""
 if os.environ.get("SUMMARY") == "1":
     prompt = ("Summarise this meeting in a few sentences, then list the decisions and the action items "
               "(who does what) as bullets. Write in the language of the meeting. Markdown, no heading.")
-    answer = subprocess.run(["omarchy-meeting-recorder", "ask", prompt], input=transcript,
+    answer = subprocess.run(["omarchy-meeting-recorder", "ask", prompt], input=agent_input,
                             capture_output=True, text=True)
     summary = answer.stdout.strip() if answer.returncode == 0 else ""
 
@@ -149,6 +165,8 @@ lines += ["tags:", "  - meeting", "---", "", f"# {title}", "",
 if links:
     lines.append(f"**People:** {', '.join(links)}")
 lines.append(f"**Recording:** [{Path(os.environ['MEETING_DIR']).name}]({Path(os.environ['MEETING_DIR']).as_uri()})")
+if context:
+    lines += ["", context.rstrip()]
 if summary:
     lines += ["", "## Summary", "", summary]
 if chapters:

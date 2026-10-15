@@ -123,7 +123,7 @@ pub type Abort = Arc<AtomicBool>;
 
 pub const CANCELLED: &str = "transcription cancelled";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Segment {
     pub start_ms: i64,
     pub end_ms: i64,
@@ -131,6 +131,7 @@ pub struct Segment {
     pub text: String,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Transcript {
     pub segments: Vec<Segment>,
     /// The language used or detected, as a whisper code.
@@ -573,7 +574,7 @@ pub fn download(
     let dir = target.parent().expect("model path has a parent");
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut part = target.as_os_str().to_owned();
-    part.push(".part");
+    part.push(format!(".{}.part", std::process::id()));
     let part = PathBuf::from(part);
     emit(events, Event::Stage(label.to_owned()));
 
@@ -1436,7 +1437,8 @@ fn language_name(code: &str) -> String {
         .unwrap_or_else(|| code.to_owned())
 }
 
-pub fn to_markdown(title: &str, date: &str, transcript: &Transcript) -> String {
+/// `context` is optional, preformatted meeting metadata, separate from spoken turns.
+pub fn to_markdown(title: &str, date: &str, transcript: &Transcript, context: &str) -> String {
     let mut out = format!("# {title}\n\n");
     out += &format!("- **Date:** {date}\n");
     out += &format!(
@@ -1447,6 +1449,7 @@ pub fn to_markdown(title: &str, date: &str, transcript: &Transcript) -> String {
         "- **Language:** {}\n\n",
         language_name(&transcript.language)
     );
+    out += context;
     out += "## Transcript\n\n";
     if transcript.segments.is_empty() {
         out += "_No speech was recognized._\n";
@@ -1563,7 +1566,7 @@ fn run_cli(work: impl FnOnce(&Events, &Abort) -> Result<Transcript, String>) -> 
                 .and_then(|t| t.format("%Y-%m-%d %H:%M"))
                 .map(|s| s.to_string())
                 .unwrap_or_default();
-            print!("{}", to_markdown("Transcript", &date, &transcript));
+            print!("{}", to_markdown("Transcript", &date, &transcript, ""));
             eprintln!("Done in {:.1}s", started.elapsed().as_secs_f64());
             glib::ExitCode::SUCCESS
         }

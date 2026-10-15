@@ -56,6 +56,8 @@ struct Inner {
     child: Option<Child>,
     /// Set when the device changed, so the capture restarts at once.
     switched: bool,
+    last_sample: Option<Instant>,
+    write_error: Option<String>,
 }
 
 struct Recording {
@@ -79,6 +81,8 @@ impl Source {
             device,
             child: None,
             switched: false,
+            last_sample: None,
+            write_error: None,
         }));
         let shared = inner.clone();
         thread::spawn(move || {
@@ -121,6 +125,7 @@ impl Source {
             timeline: Timeline::new(Instant::now()),
         });
         inner.paused = false;
+        inner.write_error = None;
         Ok(())
     }
 
@@ -133,9 +138,30 @@ impl Source {
     }
 
     pub fn stop_recording(&self) {
-        if let Some(mut recording) = self.inner.lock().unwrap().recording.take() {
-            let _ = recording.file.flush();
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(mut recording) = inner.recording.take()
+            && let Err(error) = recording
+                .file
+                .flush()
+                .and_then(|_| recording.file.get_ref().sync_data())
+        {
+            inner.write_error = Some(format!("Cannot save audio: {error}"));
         }
+    }
+
+    pub fn recording_error(&self) -> Option<String> {
+        self.inner.lock().unwrap().write_error.clone()
+    }
+
+    /// Missing frames are a capture fault; frames containing silence are healthy.
+    pub fn health(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        inner.write_error.clone().or_else(|| {
+            (!inner
+                .last_sample
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(2)))
+            .then(|| "No audio stream. Check the selected device.".into())
+        })
     }
 
     pub fn levels(&self) -> Vec<f32> {
@@ -209,22 +235,22 @@ fn capture(shared: &Mutex<Inner>) {
             / 32768.0;
         let mut guard = shared.lock().unwrap();
         let inner = &mut *guard;
+        inner.last_sample = Some(now);
         inner.levels.pop_front();
         inner.levels.push_back(peak);
+        if inner.write_error.is_some() {
+            continue;
+        }
         if let Some(Recording { file, timeline }) = inner.recording.as_mut() {
             timeline.heard(now.saturating_duration_since(asked), chunks == 1);
             if inner.paused {
                 continue;
             }
             let missing = timeline.missing_before(now);
-            let _ = write_silence(file, missing);
-            timeline.wrote(missing + (CHUNK_BYTES / FRAME_BYTES) as u64);
-            let _ = file.write_all(&buf);
-            if chunks.is_multiple_of(50) {
-                let _ = file.flush();
-            }
-            if chunks.is_multiple_of(1500) {
-                let _ = file.get_ref().sync_data();
+            let result = write_chunk(file, missing, &buf, chunks);
+            match result {
+                Ok(()) => timeline.wrote(missing + (CHUNK_BYTES / FRAME_BYTES) as u64),
+                Err(error) => inner.write_error = Some(format!("Cannot save audio: {error}")),
             }
         }
     }
@@ -233,6 +259,23 @@ fn capture(shared: &Mutex<Inner>) {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn write_chunk(
+    file: &mut BufWriter<File>,
+    missing: u64,
+    bytes: &[u8],
+    chunks: u64,
+) -> std::io::Result<()> {
+    write_silence(file, missing)?;
+    file.write_all(bytes)?;
+    if chunks.is_multiple_of(50) {
+        file.flush()?;
+    }
+    if chunks.is_multiple_of(1500) {
+        file.get_ref().sync_data()?;
+    }
+    Ok(())
 }
 
 /// Where a recording is: how much audio it should hold by now, against how
@@ -448,6 +491,16 @@ pub fn to_meter(peak: f32) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_disk_errors_are_reported_by_the_capture_writer() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut out = BufWriter::new(file);
+        assert!(write_chunk(&mut out, 0, &[0; CHUNK_BYTES], 50).is_err());
+    }
 
     const CHUNK_FRAMES: u64 = (CHUNK_BYTES / FRAME_BYTES) as u64;
 

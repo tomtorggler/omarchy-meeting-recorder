@@ -6,9 +6,30 @@ No bot joins your call, and no audio leaves your computer. It works with any mee
 
 ![The done screen in Tokyo Night: chapters on the left, the transcript on the right, a waveform player above it](screenshots/hero.webp)
 
-Open the app, check that both meters move, and press **Start recording**. When you stop, [whisper.cpp](https://github.com/ggml-org/whisper.cpp) transcribes the meeting while a 90s animation keeps you company. You get the transcript with who said what, a player to listen back from any line, and chapters written by the coding agent you already use. Everything takes the colours of your Omarchy theme.
+Open the app to see your recent meetings, or press **Record a meeting** to start immediately with your remembered devices. Ctrl+R starts or stops recording; Ctrl+H returns to your meetings. When you stop, [whisper.cpp](https://github.com/ggml-org/whisper.cpp) transcribes the meeting while a 90s animation keeps you company. You get the transcript with who said what, a player to listen back from any line, and chapters written by the coding agent you already use. Everything takes the colours of your Omarchy theme.
 
 Built for Omarchy on Hyprland (GTK 4 and libadwaita, written in Rust).
+
+## Microsoft Calendar (optional)
+
+Calendar integration is **off by default**. Choose **Connect Microsoft Calendar…** on Home, enter your work or school email and your own Entra Application (client) ID, then sign in through your browser. The app discovers the Entra tenant using the email domain; no client secret is needed.
+
+Home shows ongoing and upcoming timed events in your primary calendar for the next seven days, including recurring occurrences. Times use your computer's timezone. Cancelled, declined, and all-day events are omitted. Refresh updates both the calendar and recorded meetings; while Home is visible, the calendar also refreshes every five minutes.
+
+**Record** starts a recording with the event title and saves an invitation snapshot (organizer and non-declined invitees, excluding room/resources). Invitees remain separate from voice/speaker labels. Existing recordings keep their original snapshot if the invitation later changes. An active recording is never replaced by selecting another event.
+
+New transcripts include an **Invited participants** section with names and emails from that snapshot. [Actions](docs/actions.md#what-your-command-gets) also receive optional meeting context and structured invitees, including for previously transcribed meetings. These formats do not depend on Microsoft: future providers can supply the same snapshot, and meetings without calendar integration keep working unchanged. Invitation details do not establish attendance or assign names to recorded voices.
+
+To prepare your app registration in the [Microsoft Entra admin center](https://entra.microsoft.com):
+
+1. Register an application for your organization. A single-tenant registration works for your own tenant; a multi-tenant registration needs consent in each organization that uses it.
+2. Under **Authentication → Add a platform → Mobile and desktop applications**, add **`http://localhost`** as a redirect URI. The app uses a temporary loopback port with authorization code + S256 PKCE. Do not configure this redirect as a Web or SPA application. Do not create a client secret.
+3. Add delegated Microsoft Graph **`Calendars.ReadBasic`** (calendar details) and **`User.Read`** (confirm the signed-in account). The app also requests **`offline_access`** to refresh the session. Your organization's consent/access policy may require an administrator's approval.
+4. Copy **Application (client) ID** into the recorder's Calendar settings. Use the account's primary email or sign-in address; sign-in to a different account is rejected.
+
+Refresh tokens are stored in the Linux desktop keyring using `secret-tool` from **libsecret** and require an unlocked Secret Service keyring. Access tokens stay in process memory. Tokens are never written into settings or meeting folders. Non-secret settings are in `$XDG_CONFIG_HOME/omarchy-meeting-recorder/calendar.json` (normally `~/.config/omarchy-meeting-recorder/calendar.json`). No calendar requests run while integration is off. **Disconnect** disables calendar access and removes the saved sign-in without deleting recorded meetings. This version supports Microsoft 365 work/school accounts in Microsoft's public cloud; personal Outlook accounts, shared/secondary calendars, and other providers are not included yet.
+
+Protocol references: [desktop sign-in and PKCE](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow), [tenant discovery](https://learn.microsoft.com/en-us/entra/identity-platform/v2-protocols-oidc), [calendarView](https://learn.microsoft.com/en-us/graph/api/calendar-list-calendarview?view=graph-rest-1.0).
 
 ## Install
 
@@ -34,9 +55,15 @@ Prefer to build it yourself? See [Build from source](#build-from-source), or gra
 
 ## What it does
 
+### Finds your meetings again
+
+The home screen lists recent meetings with their date, duration and status. Search titles, participants or transcript text; a matching passage opens at its audio timestamp. The list reads your ordinary meeting folders, including older recordings. Use Refresh to pick up external changes. Preferences lets you choose the meetings folder and speech model, connect your calendar, manage actions for every meeting, and view keyboard shortcuts.
+
+Stopping returns to the list while the transcript finishes in a separate worker process. Active jobs show progress and a Cancel button; a failed or interrupted job remains visible and can be retried from its meeting. A desktop notification opens the result when ready. Native transcription crashes cannot terminate a recording in another window.
+
 ### Checks the sound before you start
 
-The app opens ready, not recording. The two meters are live from the start, the same moving waves as while recording, so you can see that both your microphone and the computer audio arrive before the meeting begins. Above each meter a menu picks the device: System default, or a microphone and an output of your own, say the headset your meeting app uses while the speakers stay the default. It can be changed during the call too, and is remembered. Type a name if you like (otherwise it becomes "Meeting 14:30"), pick the audio format and the transcript language, and press **Start recording**.
+The home screen opens without recording. A new recorder window also lets you check devices before starting. The two meters are live from the start, the same moving waves as while recording, so you can see that both your microphone and the computer audio arrive before the meeting begins. Above each meter a menu picks the device: System default, or a microphone and an output of your own, say the headset your meeting app uses while the speakers stay the default. It can be changed during the call too, and is remembered. Type a name if you like (otherwise it becomes "Meeting 14:30"), pick the audio format and the transcript language, and press **Start recording**.
 
 <p align="center"><img src="screenshots/ready.webp" alt="The ready page: meeting name, audio file, language, two meters that say Not recording, the microphone on System default and the computer audio on a USB headset, the Start recording button and Import an audio file, or drop one here" width="440"></p>
 
@@ -70,7 +97,7 @@ The bar widget shows the same while you record: a pulsing dot, a small waveform 
 
 ### Transcribes on your own machine
 
-When you stop, the window switches straight to the transcribing animation: it saves the audio, then [whisper-rs](https://github.com/tazz4843/whisper-rs) transcribes the meeting, and the lines type themselves out with the speakers' names as they are recognised. It ends on 100% and DONE, and stays at least ten seconds, also for a short recording. Nothing is sent anywhere.
+When you stop, the app returns to your meetings and saves the audio, then [whisper-rs](https://github.com/tazz4843/whisper-rs) transcribes it in the background. Open the processing job to watch the animation and the lines appearing with the speakers' names as they are recognised. The result is available as soon as transcription finishes. Audio stays on your computer.
 
 <p align="center"><img src="screenshots/transcribing.webp" alt="The transcribing animation at 77 percent with lines from Maya and Tom" width="440"></p>
 
@@ -92,7 +119,9 @@ On the left: the meeting name and one row per speaker, which you can rename at a
 
 ### Lets you fix it where you read it
 
-Hover a line and three buttons appear: edit the text in place, give the line to the next speaker, or delete it. A deleted line comes back with Undo.
+Search within a transcript with Ctrl+F, choose playback speed up to 2×, or jump to a bookmark. Ctrl+B bookmarks the current moment while recording; bookmarks survive recovery and live in `bookmarks.json`.
+
+Hover a line and three buttons appear: edit the text in place, choose its speaker by name, or delete it. A deleted line comes back with Undo.
 
 ![Hovering a line: edit, next speaker and delete](screenshots/row-actions.webp)
 
@@ -108,7 +137,9 @@ Chapters are an extra, not a requirement: without an agent the button is simply 
 
 ### Runs your own actions
 
-Put a few scripts of your own under **Actions** on the done page: store the transcript in your notes, publish it, mail it around. They go in `~/.config/omarchy-meeting-recorder/config.toml`, each with a name for the menu and a command. An action can also run on its own, as soon as the transcript is done. Until there is one, the button is **Add actions…** and explains how. See [Actions](#actions).
+Manage scripts in **Preferences → Actions → Manage actions**, also available in every transcript’s **Actions** menu. Add, edit, or delete actions in one place. They live in `~/.config/omarchy-meeting-recorder/config.toml`, each with a name for the menu and a command. **Run automatically** (`auto = true`) runs one on its own as soon as a new transcript is done, after the chapters; opening or editing an old transcript never does. See [Actions](#actions).
+
+**Copy text** copies the transcript without timestamps. **Save notes…** exports a Markdown copy to a folder you choose, remembers that folder for next time, and never overwrites an earlier export.
 
 ### Wears your Omarchy theme
 
@@ -120,6 +151,8 @@ The app reads the palette of the current theme (`colors.toml`): the background, 
 
 ### Keeps your recording safe
 
+Capture health is checked independently of sound levels: silence is normal, a missing audio stream or a write failure is an issue. Warnings appear in the recorder, compact view, desktop notification and bar widget. A write failure stops both capture streams and marks the saved meeting as needing attention. Each recording gets a fresh folder even when another meeting has the same title.
+
 If the app quits while it records (a crash, a logout, a power cut), the next start finds the unfinished recording and offers to save it as a meeting, keep it for later, or discard it.
 
 <p align="center"><img src="screenshots/recovery.webp" alt="Unfinished recording found, with Save, Later and Discard" width="440"></p>
@@ -128,8 +161,8 @@ If the app quits while it records (a crash, a logout, a power cut), the next sta
 
 - **Keyboard.** Ctrl+M switches between the full window and the compact strip. Ctrl+N opens another window. On the done page Enter copies the transcript. Ctrl+F finds text in it: the match is marked, Enter and Shift+Enter move between matches, and Escape closes the bar. Ctrl+W closes the window and Ctrl+Q all of them, and they ask first while recording or transcribing.
 - **The name** stays editable all the time. After the transcript is done, changing it (Enter, or leaving the field) renames the meeting folder and the heading in the transcript.
-- **Closing** while recording or transcribing asks first. You can stop and close, let the transcription finish in the background and quit afterwards, or cancel the transcription; the audio is kept either way.
-- **Opening a meeting later.** Double-click its `.meeting-recorder` file, or run `omarchy-meeting-recorder <folder>`. It opens on the done page with the settings it was made with. When the window is busy recording or transcribing, the meeting opens in a window of its own.
+- **Closing** the recorder window while recording or transcribing asks first. You can stop and close, let the transcription finish in the background and quit afterwards, or cancel the transcription; the audio is kept either way. Closing Home leaves active jobs running and exits once they finish.
+- **Opening a meeting later.** Find it on the home screen, double-click its `.meeting-recorder` file, or run `omarchy-meeting-recorder <folder>`. It opens on the done page with the settings it was made with. When the window is busy recording or transcribing, the meeting opens in a window of its own.
 - **More than one window.** Ctrl+N, `omarchy-meeting-recorder new-window` or New Window in the launcher opens another one, to read an older meeting or start the next while the last one is still transcribing. Every window shows its own meeting; one records at a time. The bar widget and the keybindings follow the window that is recording, else the one transcribing.
 - **Keybindings.** `omarchy-meeting-recorder start`, `pause`, `stop` and `compact` control the running app, so you can bind them to keys in Hyprland.
 

@@ -12,6 +12,8 @@ use serde_json::{Value, json};
 use crate::chapters::Chapter;
 use crate::export::Format;
 
+mod context;
+
 pub const EXTENSION: &str = "meeting-recorder";
 pub const DEFAULT_YOU: &str = "You";
 pub const DEFAULT_REMOTE: &str = "Remote";
@@ -19,6 +21,8 @@ pub const DEFAULT_REMOTE: &str = "Remote";
 #[derive(Clone, Debug)]
 pub struct Manifest {
     pub title: String,
+    /// Invitation metadata, kept separate from identified voices.
+    pub calendar: Option<crate::calendar::Meeting>,
     pub started_at: i64,
     pub duration_secs: i64,
     pub format: Format,
@@ -50,6 +54,7 @@ impl Manifest {
             "app": crate::APP_NAME,
             "version": 1,
             "title": self.title,
+            "calendar": self.calendar,
             "started_at": self.started_at,
             "duration_secs": self.duration_secs,
             "format": self.format.key(),
@@ -69,6 +74,7 @@ impl Manifest {
     fn from_json(value: &Value) -> Option<Manifest> {
         Some(Manifest {
             title: value["title"].as_str()?.to_owned(),
+            calendar: serde_json::from_value(value["calendar"].clone()).ok(),
             started_at: value["started_at"].as_i64()?,
             duration_secs: value["duration_secs"].as_i64().unwrap_or(0),
             format: Format::from_key(value["format"].as_str().unwrap_or("mono")),
@@ -229,14 +235,56 @@ pub fn find(dir: &Path) -> Option<PathBuf> {
 /// Writes the manifest into `dir`, replacing one with another name (after a rename).
 pub fn write(dir: &Path, manifest: &Manifest) -> std::io::Result<PathBuf> {
     let target = path_for(dir, &manifest.title);
-    if let Some(old) = find(dir)
+    let old = find(dir);
+    let text = serde_json::to_string_pretty(&manifest.to_json()).unwrap_or_default() + "\n";
+    crate::bookmarks::atomic_write(&target, text.as_bytes())?;
+    if let Some(old) = old
         && old != target
     {
         let _ = std::fs::remove_file(old);
     }
-    let text = serde_json::to_string_pretty(&manifest.to_json()).unwrap_or_default() + "\n";
-    std::fs::write(&target, text)?;
     Ok(target)
+}
+
+/// Replace transcript bytes before publishing their metadata. Each file replacement
+/// is atomic; if metadata cannot be saved, restore the previous transcript.
+pub fn update(dir: &Path, manifest: &Manifest, transcript: Option<&str>) -> std::io::Result<()> {
+    let path = dir.join("transcript.md");
+    let previous = if transcript.is_some() {
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    if let Some(text) = transcript {
+        crate::bookmarks::atomic_write(&path, text.as_bytes())?;
+    }
+    if let Err(error) = write(dir, manifest) {
+        if transcript.is_some() {
+            let restored = match previous {
+                Some(bytes) => crate::bookmarks::atomic_write(&path, &bytes),
+                None => std::fs::remove_file(&path),
+            };
+            if let Err(restore_error) = restored {
+                return Err(std::io::Error::other(format!(
+                    "{error}; could not restore previous transcript: {restore_error}"
+                )));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn read_transcript(dir: &Path) -> std::io::Result<Option<String>> {
+    match std::fs::read_to_string(dir.join("transcript.md")) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Reads a meeting from a `.meeting-recorder` file or from its folder. A folder without
@@ -279,6 +327,7 @@ fn from_folder(dir: &Path) -> Option<Manifest> {
     };
     Some(Manifest {
         title: title.to_owned(),
+        calendar: None,
         started_at: started.to_unix(),
         duration_secs: 0,
         format,
@@ -293,9 +342,63 @@ fn from_folder(dir: &Path) -> Option<Manifest> {
     })
 }
 
+/// `01:23` or `1:02:03` to milliseconds.
+pub fn clock_to_ms(clock: &str) -> i64 {
+    clock
+        .split(':')
+        .filter_map(|part| part.parse::<i64>().ok())
+        .fold(0, |total, part| total * 60 + part)
+        * 1000
+}
+
+/// Splits `**[01:23] You:** text` into its time, speaker and text.
+pub fn parse_segment(line: &str) -> Option<(&str, &str, &str)> {
+    let rest = line.strip_prefix("**[")?;
+    let (time, rest) = rest.split_once("] ")?;
+    let (speaker, text) = rest.split_once(":** ")?;
+    Some((time, speaker, text.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{relabel, side_of};
+
+    #[test]
+    fn calendar_snapshot_round_trips_without_changing_speaker_names() {
+        let mut manifest =
+            super::Manifest::from_json(&serde_json::json!({"title":"Planning", "started_at":100}))
+                .unwrap();
+        assert!(manifest.calendar.is_none());
+        manifest.calendar = Some(crate::calendar::Meeting {
+            provider: "microsoft".into(),
+            id: "occurrence-2".into(),
+            title: "Planning".into(),
+            starts_at: 100,
+            ends_at: 200,
+            participants: vec![crate::calendar::Person {
+                name: "Alex".into(),
+                email: "alex@example.com".into(),
+            }],
+        });
+        let restored = super::Manifest::from_json(&manifest.to_json()).unwrap();
+        assert_eq!(restored.calendar, manifest.calendar);
+        assert_eq!(restored.people(), vec!["You", "Remote"]);
+    }
+
+    #[test]
+    fn failed_metadata_update_restores_the_previous_transcript() {
+        let dir = std::env::temp_dir().join(format!("mr-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest =
+            super::from_folder(std::path::Path::new("/nowhere/202609291404 Call")).unwrap();
+        super::update(&dir, &manifest, Some(MD)).unwrap();
+        manifest.title = "Blocked".into();
+        std::fs::create_dir(super::path_for(&dir, &manifest.title)).unwrap();
+        assert!(super::update(&dir, &manifest, Some("replacement")).is_err());
+        assert_eq!(super::read_transcript(&dir).unwrap().unwrap(), MD);
+        assert_eq!(super::open(&dir).unwrap().1.title, "Call");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn labels_tell_the_side_and_number() {
@@ -318,7 +421,8 @@ mod tests {
 
     #[test]
     fn speakers_with_the_same_name_are_one_person() {
-        let mut manifest = super::from_folder(std::path::Path::new("/nowhere/202609291404 Call")).unwrap();
+        let mut manifest =
+            super::from_folder(std::path::Path::new("/nowhere/202609291404 Call")).unwrap();
         manifest.speakers = vec!["Jankees".into(), "Jankees".into(), "Denise".into()];
         assert_eq!(manifest.people(), vec!["Jankees", "Denise"]);
     }

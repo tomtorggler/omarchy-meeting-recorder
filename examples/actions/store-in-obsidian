@@ -27,6 +27,9 @@ date = os.environ["MEETING_DATE"]  # 2026-09-25 14:30
 seconds = int(os.environ.get("MEETING_DURATION", "0"))
 duration = f"{round(seconds / 60)} minutes" if seconds >= 90 else f"{seconds} seconds"
 transcript = Path(os.environ["MEETING_TRANSCRIPT"]).read_text()
+context = os.environ.get("MEETING_CONTEXT", "")
+# Older transcripts can still have an invitation snapshot in their manifest.
+agent_input = transcript if not context or context in transcript else context + transcript
 manifest = json.loads(Path(os.environ["MEETING_MANIFEST"]).read_text()) if os.environ.get("MEETING_MANIFEST") else {}
 
 # The people who were given a name; "You", "Remote 2" and "Speaker 1" are not people yet.
@@ -49,7 +52,7 @@ summary = ""
 if os.environ.get("SUMMARY") == "1":
     prompt = ("Summarise this meeting in a few sentences, then list the decisions and the action items "
               "(who does what) as bullets. Write in the language of the meeting. Markdown, no heading.")
-    answer = subprocess.run(["omarchy-meeting-recorder", "ask", prompt], input=transcript,
+    answer = subprocess.run(["omarchy-meeting-recorder", "ask", prompt], input=agent_input,
                             capture_output=True, text=True)
     summary = answer.stdout.strip() if answer.returncode == 0 else ""
 
@@ -61,6 +64,8 @@ lines += ["tags:", "  - meeting", "---", "", f"# {title}", "",
 if links:
     lines.append(f"**People:** {', '.join(links)}")
 lines.append(f"**Recording:** [{Path(os.environ['MEETING_DIR']).name}]({Path(os.environ['MEETING_DIR']).as_uri()})")
+if context:
+    lines += ["", context.rstrip()]
 if summary:
     lines += ["", "## Summary", "", summary]
 if chapters:

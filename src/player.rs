@@ -41,10 +41,11 @@ struct Playback {
     next_frame: Option<(i64, Vec<u8>)>,
     started: Instant,
     from_us: i64,
+    speed: f64,
 }
 
 impl Playback {
-    fn start(files: &[PathBuf], from_us: i64, video: Option<&Path>) -> Option<Playback> {
+    fn start(files: &[PathBuf], from_us: i64, video: Option<&Path>, speed: f64) -> Option<Playback> {
         let at = format!("{:.3}", from_us as f64 / 1_000_000.0);
         let mut ffmpeg = Command::new("ffmpeg");
         ffmpeg.args(["-v", "error", "-nostdin"]);
@@ -54,8 +55,11 @@ impl Playback {
         if files.len() > 1 {
             ffmpeg.args([
                 "-filter_complex",
-                &format!("amix=inputs={}:normalize=0", files.len()),
+                &format!("amix=inputs={}:normalize=0,atempo={speed}", files.len()),
             ]);
+        }
+        if files.len() == 1 {
+            ffmpeg.args(["-af", &format!("atempo={speed}")]);
         }
         ffmpeg
             .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-"])
@@ -87,6 +91,7 @@ impl Playback {
                 next_frame: None,
                 started: Instant::now(),
                 from_us,
+                speed,
             }),
             Err(_) => {
                 let _ = ffmpeg.kill();
@@ -97,7 +102,7 @@ impl Playback {
     }
 
     fn position_us(&self) -> i64 {
-        self.from_us + self.started.elapsed().as_micros() as i64
+        self.from_us + (self.started.elapsed().as_micros() as f64 * self.speed) as i64
     }
 
     fn ended(&mut self) -> bool {
@@ -259,6 +264,7 @@ pub struct Player {
     /// Called with the position in ms while playing, for the transcript highlight.
     on_position: PositionCallback,
     ticking: Rc<Cell<bool>>,
+    speed: Rc<Cell<f64>>,
 }
 
 impl Player {
@@ -322,6 +328,7 @@ impl Player {
             state: Rc::default(),
             on_position: Rc::default(),
             ticking: Rc::default(),
+            speed: Rc::new(Cell::new(1.0)),
         };
 
         let this = player.clone();
@@ -329,6 +336,19 @@ impl Player {
             this.draw(cr, f64::from(width), f64::from(height));
         });
 
+        let speed = gtk::DropDown::from_strings(&["1×", "1.25×", "1.5×", "2×"]);
+        speed.set_tooltip_text(Some("Playback speed"));
+        player.root.append(&speed);
+        let this = player.clone();
+        speed.connect_selected_notify(move |dropdown| {
+            let playing = this.is_playing();
+            this.pause();
+            this.speed
+                .set([1.0, 1.25, 1.5, 2.0][dropdown.selected() as usize]);
+            if playing {
+                this.play();
+            }
+        });
         let this = player.clone();
         player.button.connect_clicked(move |_| this.toggle());
 
@@ -513,7 +533,7 @@ impl Player {
             }
             state.playback = None;
             let video = state.video.clone();
-            state.playback = Playback::start(&state.files, state.paused_at_us, video.as_deref());
+            state.playback = Playback::start(&state.files, state.paused_at_us, video.as_deref(), self.speed.get());
             state.playback.is_some()
         };
         self.set_playing_icon(started);

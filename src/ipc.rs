@@ -41,6 +41,7 @@ pub struct Status {
     pub progress: f64,
     /// The meeting's folder, once it has one.
     pub folder: String,
+    pub stage: String,
 }
 
 pub type SharedStatus = Arc<Mutex<Status>>;
@@ -158,6 +159,8 @@ pub fn serve(
                 "computer": round(to_meter(system.recent_peak(3))),
                 "progress": round(snapshot.progress),
                 "folder": snapshot.folder,
+                "warning": if taking { mic.health().map(|s| format!("Microphone: {s}"))
+                    .or_else(|| system.health().map(|s| format!("Computer: {s}"))) } else { None },
             })
             .to_string()
                 + "\n";

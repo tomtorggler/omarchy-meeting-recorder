@@ -160,6 +160,29 @@ pub fn set_bar_widget_offered() {
     save("bar_widget_offered", "yes");
 }
 
+pub fn notes_folder() -> Option<PathBuf> {
+    load()["notes_folder"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+}
+
+pub fn meetings_folder() -> PathBuf {
+    load()["meetings_folder"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| glib::home_dir().join("Documents/Meetings"))
+}
+
+pub fn save_meetings_folder(path: &Path) {
+    save("meetings_folder", &path.to_string_lossy());
+}
+
+pub fn save_notes_folder(path: &Path) {
+    save("notes_folder", &path.to_string_lossy());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

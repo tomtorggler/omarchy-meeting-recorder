@@ -22,6 +22,7 @@ BarWidget {
   property int elapsed: 0
   property real progress: 0
   property string title: ""
+  property string warning: ""
   property var micHistory: emptyHistory()
   property var computerHistory: emptyHistory()
 
@@ -60,6 +61,7 @@ BarWidget {
 
     var wasShown = root.shown
     root.recorderState = /^(off|idle|recording|paused|stopping|transcribing|done)$/.test(data.state) ? data.state : "off"
+    root.warning = typeof data.warning === "string" ? data.warning.slice(0, 300) : ""
     root.elapsed = Math.max(0, Math.floor(Number(data.elapsed) || 0))
     root.progress = root.level(data.progress)
     root.title = typeof data.title === "string" ? data.title.slice(0, root.maxTitleLength) : ""
@@ -156,7 +158,8 @@ BarWidget {
     Text {
       anchors.verticalCenter: parent.verticalCenter
       textFormat: Text.PlainText
-      text: root.recorderState === "stopping" ? "saving…"
+      text: root.warning ? "Audio issue · " + root.clock(root.elapsed)
+          : root.recorderState === "stopping" ? "saving…"
           : root.recorderState === "paused" ? "paused " + root.clock(root.elapsed)
           : root.recorderState === "transcribing" ? "transcribing " + Math.round(root.progress * 100) + "%"
           : root.clock(root.elapsed)
@@ -173,7 +176,7 @@ BarWidget {
     hoverEnabled: true
     cursorShape: Qt.PointingHandCursor
     onClicked: if (root.bar) root.bar.run("omarchy-meeting-recorder")
-    onEntered: if (root.bar) root.bar.showTooltip(root, root.title ? "Recording: " + root.title : "Recording a meeting")
+    onEntered: if (root.bar) root.bar.showTooltip(root, root.warning || (root.title ? "Recording: " + root.title : "Recording a meeting"))
     onExited: if (root.bar) root.bar.hideTooltip(root)
   }
 }

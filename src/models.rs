@@ -102,6 +102,34 @@ pub fn config_file() -> PathBuf {
         .join("config.toml")
 }
 
+pub fn save_configured(name: &str) -> std::io::Result<()> {
+    let path = config_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let mut before_tables = true;
+    let body = text
+        .lines()
+        .filter(|line| {
+            if line.trim_start().starts_with('[') {
+                before_tables = false;
+            }
+            !(before_tables
+                && line
+                    .split_once('=')
+                    .is_some_and(|(key, _)| key.trim() == "model"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let config = format!("model = {}\n{body}\n", serde_json::to_string(name)?);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::bookmarks::atomic_write(&path, config.as_bytes())
+}
+
 /// The configured model: a name from `MODELS` or a path to a model file.
 pub fn configured() -> String {
     if let Some(name) = OVERRIDE.lock().unwrap().clone() {
