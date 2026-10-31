@@ -28,8 +28,6 @@
 //! the read-only sandbox under it as a second layer. Crush and Antigravity have
 //! neither and are refused rather than run with tools.
 
-mod piped;
-
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -48,11 +46,11 @@ pub const MAX_REQUEST_BYTES: usize = 512 * 1024;
 const MAX_STREAM_BYTES: u64 = 1024 * 1024;
 /// The answer handed back.
 pub const MAX_ANSWER_BYTES: usize = 128 * 1024;
-/// `ulimit -f` for file-captured agents, in shell-dependent units (Bash uses
-/// 512-byte blocks). The kernel refuses writes past it, which
+/// `ulimit -f` for the agent. Bash running as `sh` counts it in 512-byte
+/// blocks, not KiB, so 2048 is 1 MiB. The kernel refuses writes past it, which
 /// bounds what a runaway agent can put on disk before anything reads it back.
 /// It has to fit the agent's own session file, which holds the whole prompt.
-const FILE_LIMIT_BLOCKS: u64 = 2048;
+const FILE_LIMIT_KB: u64 = 2048;
 /// Linux refuses a single argv string over 128 KiB (MAX_ARG_STRLEN); agents
 /// that only take the prompt as an argument cannot go past it.
 const MAX_ARG_BYTES: usize = 120 * 1024;
@@ -267,15 +265,6 @@ fn tools_all_false(tools: &serde_json::Value) -> bool {
         .is_some_and(|map| !map.is_empty() && map.values().all(|v| v == false))
 }
 
-/// Capture policy: some CLIs only flush reliably to files; others maintain
-/// their own state and must not inherit our process-wide output-file limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CaptureMode {
-    Files,
-    Stdout,
-    CodexAnswer,
-}
-
 /// The command for one agent, before it runs.
 #[derive(Debug)]
 struct Built {
@@ -284,8 +273,7 @@ struct Built {
     env: Vec<(&'static str, OsString)>,
     /// The prompt goes in on stdin; otherwise it is already in `args`.
     stdin: bool,
-    file_limit_blocks: u64,
-    capture: CaptureMode,
+    file_limit_kb: u64,
 }
 
 fn build(id: &str, prompt: &str, dir: &Path) -> Result<Built, String> {
@@ -295,8 +283,7 @@ fn build(id: &str, prompt: &str, dir: &Path) -> Result<Built, String> {
         args: Vec::new(),
         env: Vec::new(),
         stdin: true,
-        file_limit_blocks: FILE_LIMIT_BLOCKS,
-        capture: CaptureMode::Files,
+        file_limit_kb: FILE_LIMIT_KB,
     };
     // --strict-mcp-config without --mcp-config loads no MCP servers, so none of
     // their tools exist either; it also halves startup time.
@@ -310,15 +297,32 @@ fn build(id: &str, prompt: &str, dir: &Path) -> Result<Built, String> {
     ];
     let pi = ["-p", "--no-tools", "--no-session"];
     match id {
-        "claude" => {
-            built.args = s(&claude);
-            built.capture = CaptureMode::Stdout;
-        }
+        "claude" => built.args = s(&claude),
         "codex" => {
-            built.capture = CaptureMode::CodexAnswer;
+            // Codex keeps SQLite databases under $CODEX_HOME, and on a machine
+            // that has used it they are past the ulimit. A fresh database does
+            // not help on its own, since Codex backfills it from the sessions
+            // in its home. So its home is moved into the throwaway directory
+            // with only the credentials and config linked in, and --ephemeral
+            // keeps the run from writing a session. The databases it creates
+            // there still pass 1 MiB, so it gets the limit goose has.
+            let source = std::env::var_os("CODEX_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home().join(".codex"));
+            let codex_home = dir.join("codex-home");
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&codex_home)
+                .map_err(|e| e.to_string())?;
+            for name in ["auth.json", "config.toml"] {
+                link_regular(&source.join(name), &codex_home.join(name));
+            }
+            built.env.push(("CODEX_HOME", codex_home.into()));
+            built.file_limit_kb = 8192;
             // Codex prints progress around the answer on stdout, so it writes
             // the answer to a file instead; `-` reads the prompt from stdin.
             built.args = s(&["exec", "--sandbox", "read-only", "--skip-git-repo-check"]);
+            built.args.push("--ephemeral".into());
             built.args.extend(s(&["--color", "never", "-o"]));
             built.args.push(dir.join("answer.txt").into());
             for key in CODEX_NO_TOOLS {
@@ -341,9 +345,6 @@ fn build(id: &str, prompt: &str, dir: &Path) -> Result<Built, String> {
         "omp" => built.args = s(&["-p", "--no-tools", "--mode", "json"]),
         "ori" => {
             let harness = ori_harness().ok_or("Ori needs Claude Code or Pi installed")?;
-            if harness == "claude" {
-                built.capture = CaptureMode::Stdout;
-            }
             built.args = vec![harness.into()];
             built
                 .args
@@ -406,7 +407,7 @@ fn build(id: &str, prompt: &str, dir: &Path) -> Result<Built, String> {
             built.env.push(("GOOSE_MODE", "chat".into()));
             built.env.push(("GOOSE_TELEMETRY_OFF", "1".into()));
             built.args = s(&["run", "--no-profile", "--no-session", "--quiet", "-i", "-"]);
-            built.file_limit_blocks = 8192;
+            built.file_limit_kb = 8192;
         }
         other => return Err(refusal(other)),
     }
@@ -452,9 +453,6 @@ pub fn run(agent: &Agent, prompt: &str, text: &str) -> Result<String, String> {
 
 fn run_in(agent: &Agent, prompt: &str, dir: &Path) -> Result<String, String> {
     let built = build(&agent.id, prompt, dir)?;
-    if built.capture != CaptureMode::Files {
-        return piped::run(agent, prompt, dir, built, TIMEOUT, KILL_GRACE);
-    }
     let (out_path, err_path) = (dir.join("stdout.txt"), dir.join("stderr.txt"));
     let stdout = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
     let stderr = std::fs::File::create(&err_path).map_err(|e| e.to_string())?;
@@ -477,7 +475,7 @@ fn run_in(agent: &Agent, prompt: &str, dir: &Path) -> Result<String, String> {
         // process dies before it can kill it; the loop below is the backstop.
         .arg(r#"ulimit -f "$1" && secs=$2 && shift 2 && exec timeout -k 5 "$secs" "$@""#)
         .arg("sh")
-        .arg(built.file_limit_blocks.to_string())
+        .arg(built.file_limit_kb.to_string())
         .arg(TIMEOUT.as_secs().to_string())
         .arg(&built.program)
         .args(&built.args)
@@ -558,7 +556,7 @@ fn run_in(agent: &Agent, prompt: &str, dir: &Path) -> Result<String, String> {
         }));
     }
 
-    let answer = tidy(&read_answer(&agent.id, &stdout));
+    let answer = tidy(&read_answer(&agent.id, &stdout, dir));
     let answer = truncate(&answer, MAX_ANSWER_BYTES);
     if answer.trim().is_empty() {
         return Err(
@@ -568,9 +566,13 @@ fn run_in(agent: &Agent, prompt: &str, dir: &Path) -> Result<String, String> {
     Ok(answer.to_owned())
 }
 
-/// File-captured agents print prose, except omp, which streams NDJSON events.
-fn read_answer(id: &str, stdout: &str) -> String {
+/// The answer before tidying: codex writes it to a file, omp streams NDJSON
+/// events, the rest print prose.
+fn read_answer(id: &str, stdout: &str, dir: &Path) -> String {
     match id {
+        "codex" => read_bounded(&dir.join("answer.txt"), MAX_ANSWER_BYTES as u64)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default(),
         "omp" => stdout
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -821,19 +823,25 @@ mod tests {
             ]
         );
         assert!(built.stdin);
-        assert_eq!(built.capture, CaptureMode::Stdout);
     }
 
     #[test]
     fn codex_turns_every_tool_feature_off_and_reads_stdin() {
-        let built = build("codex", "hi", Path::new("/w")).unwrap();
+        let dir = workdir().unwrap();
+        let built = build("codex", "hi", &dir).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
         let a = args(&built);
-        assert_eq!(built.capture, CaptureMode::CodexAnswer);
         assert_eq!(
-            &a[..4],
-            ["exec", "--sandbox", "read-only", "--skip-git-repo-check"]
+            &a[..5],
+            [
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--skip-git-repo-check",
+                "--ephemeral"
+            ]
         );
-        assert!(a.contains(&"/w/answer.txt".to_owned()));
+        assert!(a.contains(&dir.join("answer.txt").to_string_lossy().into_owned()));
         for key in CODEX_NO_TOOLS {
             assert!(a.contains(&(*key).to_owned()), "{key}");
         }
@@ -841,10 +849,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_state_stays_in_the_working_directory() {
+        let dir = workdir().unwrap();
+        let built = build("codex", "hi", &dir).unwrap();
+        let made = dir.join("codex-home").is_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(made);
+        assert!(
+            built
+                .env
+                .iter()
+                .any(|(k, v)| *k == "CODEX_HOME" && *v == dir.join("codex-home").as_os_str())
+        );
+        assert_eq!(built.file_limit_kb, 8192);
+    }
+
+    #[test]
     fn opencode_uses_the_inline_agent_with_an_in_memory_database() {
         let built = build("opencode", "hi", Path::new("/w")).unwrap();
         assert_eq!(args(&built), ["run", "--pure", "--agent", OPENCODE_AGENT]);
-        assert_eq!(built.capture, CaptureMode::Files);
         assert!(
             built
                 .env
@@ -885,7 +908,7 @@ mod tests {
                 .iter()
                 .any(|(k, v)| *k == "GOOSE_MODE" && v == "chat")
         );
-        assert_eq!(built.file_limit_blocks, 8192);
+        assert_eq!(built.file_limit_kb, 8192);
     }
 
     #[test]
@@ -920,7 +943,7 @@ mod tests {
         let stream = r#"{"type":"start"}
 {"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Hallo"},{"type":"thinking","text":"x"}]}}
 not json"#;
-        assert_eq!(read_answer("omp", stream), "Hallo");
+        assert_eq!(read_answer("omp", stream, Path::new("/w")), "Hallo");
     }
 
     #[test]
